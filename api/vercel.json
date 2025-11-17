@@ -1,7 +1,0 @@
-{
-  "routes": [
-    { "src": "/sicoob/emitir", "dest": "/api/sicoobapi.js" },
-    { "src": "/sicoob/pdf",    "dest": "/api/sicoobapi.js" }
-  ]
-}
-
