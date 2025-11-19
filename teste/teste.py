@@ -18,8 +18,9 @@ SICOOB_BASE_URL = "https://api.sicoob.com.br/cobranca-bancaria/v3"
 SICOOB_BOLETO_URL = f"{SICOOB_BASE_URL}/boletos"
 SICOOB_SEGUNDA_VIA_URL = f"{SICOOB_BASE_URL}/boletos/segunda-via"
 
-# CLIENT_ID padrão (caso não exista cliente_id na tabela)
-DEFAULT_CLIENT_ID = "ca417614-7d6f-4f89-ba39-f18ea496431e"
+# Fallback: se no banco não tiver cliente_id, ainda usamos esse padrão
+CLIENT_ID_DEFAULT = "ca417614-7d6f-4f89-ba39-f18ea496431e"
+
 SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inclusao"
 
 # ===================== CONFIG SUPABASE ======================
@@ -34,14 +35,14 @@ SUPABASE_KEY = os.environ.get(
 # {
 #   "user@dominio.com": {
 #       "cert": (cert_path, key_path),
-#       "cliente_id": "409987",   # usado como numeroCliente E como client_id do OAuth
+#       "cliente_id": "<CLIENT_ID OAuth>",
 #       "conta": 50300
 #   }
 # }
 CERT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-# ===================== CARREGAR CERTIFICADO DO SUPABASE ======================
+# ===================== CARREGAR CERTIFICADO + CLIENT_ID + CONTA ======================
 
 def carregar_certificados_local(
     user: Optional[str] = None
@@ -51,15 +52,11 @@ def carregar_certificados_local(
     Se 'user' for informado, filtra pelos registros daquele usuário.
 
     Tabela certifica_sicoob:
-      - id           (bigint)
-      - created_at   (timestamp)
-      - pem          (text / base64)
-      - key          (text / base64)
-      - cliente_id   (text)   -> vamos usar como:
-                                  a) numeroCliente do Sicoob
-                                  b) client_id do OAuth, dinamicamente
-      - user         (text)
-      - conta        (bigint) -> numeroContaCorrente padrão
+      - pem (text, base64)
+      - key (text, base64)
+      - cliente_id (text)  -> CLIENT_ID OAuth do Sicoob
+      - conta (bigint)     -> número da conta corrente
+      - user (text)
 
     Retorna:
       ( (cert_path, key_path), cliente_id, conta, erro )
@@ -69,7 +66,7 @@ def carregar_certificados_local(
 
     cache_key = user or "_default"
 
-    # Se já está em cache, reaproveita
+    # Reaproveita cache se já carregou
     if cache_key in CERT_CACHE:
         info = CERT_CACHE[cache_key]
         return info["cert"], info.get("cliente_id"), info.get("conta"), None
@@ -77,14 +74,11 @@ def carregar_certificados_local(
     if not SUPABASE_KEY:
         return None, None, None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
 
-    # Monta parâmetros da consulta
     params = {
         "select": "pem,key,cliente_id,conta",
         "order": "id.desc",
         "limit": "1",
     }
-
-    # se tiver user, filtra: ?user=eq.email@...
     if user:
         params["user"] = f"eq.{user}"
 
@@ -115,20 +109,20 @@ def carregar_certificados_local(
     row = rows[0]
     pem_b64 = row.get("pem")
     key_b64 = row.get("key")
-    cliente_id = row.get("cliente_id")  # texto
-    conta = row.get("conta")            # bigint (pode vir como int ou str)
+    cliente_id = row.get("cliente_id")  # CLIENT_ID OAuth
+    conta = row.get("conta")            # conta corrente
 
     if not pem_b64 or not key_b64:
         return None, None, None, "Campos pem/key vazios"
 
-    # Decodificar base64
+    # Decodifica base64
     try:
         pem_bytes = base64.b64decode(pem_b64)
         key_bytes = base64.b64decode(key_b64)
     except Exception as e:
         return None, None, None, f"Erro ao decodificar base64: {e}"
 
-    # Criar arquivos temporários .pem e .key
+    # Cria arquivos temporários .pem e .key
     try:
         cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
         key_fd, key_path = tempfile.mkstemp(suffix=".key")
@@ -155,23 +149,23 @@ def carregar_certificados_local(
     return CERT_CACHE[cache_key]["cert"], cliente_id, conta, None
 
 
-# ===================== TOKEN SICOOB ======================
+# ===================== TOKEN SICOOB (CLIENT_ID DINÂMICO) ======================
 
-def gerar_token_sicoob(cert_files: Tuple[str, str], cliente_id: Optional[str] = None):
-    """
-    Gera o token do Sicoob usando o certificado.
-    Se cliente_id for informado, usamos ele como client_id (dinâmico).
-    Caso contrário, usamos o DEFAULT_CLIENT_ID.
-    """
+def gerar_token_sicoob(
+    cert_files: Tuple[str, str],
+    client_id_from_db: Optional[str]
+):
     cert_path, key_path = cert_files
 
-    client_id_oauth = (cliente_id or "").strip() or DEFAULT_CLIENT_ID
+    client_id = client_id_from_db or CLIENT_ID_DEFAULT
 
     data = {
         "grant_type": "client_credentials",
-        "client_id": client_id_oauth,
+        "client_id": client_id,
         "scope": SICOOB_SCOPE,
     }
+
+    print(">> TOKEN: usando client_id =", client_id)
 
     try:
         resp = requests.post(
@@ -187,9 +181,10 @@ def gerar_token_sicoob(cert_files: Tuple[str, str], cliente_id: Optional[str] = 
     try:
         j = resp.json()
     except ValueError:
-        return None, f"Resposta TOKEN inválida: {resp.text}"
+        return None, f"Resposta TOKEN inválida (não é JSON): {resp.text}"
 
     if not resp.ok:
+        # aqui já cai aquele "invalid_client" se estiver errado
         return None, f"Erro Token: {j}"
 
     token = j.get("access_token")
@@ -218,7 +213,7 @@ def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[st
     try:
         j = resp.json()
     except Exception:
-        return None, f"Resposta inválida do Sicoob: {resp.text}"
+        return None, f"Resposta inválida do Sicoob (não é JSON): {resp.text}"
 
     if not resp.ok:
         return None, f"Erro na emissão: {j}"
@@ -226,7 +221,7 @@ def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[st
     return j, None
 
 
-# ===================== BAIXAR PDF ======================
+# ===================== BAIXAR PDF (SEGUNDA VIA) ======================
 
 def baixar_pdf_boleto(
     token: str,
@@ -281,22 +276,18 @@ def baixar_pdf_boleto(
 
 @app.get("/")
 def home():
-    return "API Sicoob (Flask) — certificado, cliente_id (numeroCliente/client_id) e conta vindos do Supabase por usuário."
+    return "API Sicoob (Flask) — certificado, client_id OAuth e conta corrente vindos do Supabase por usuário."
 
 
 @app.post("/sicoob/emitir")
 def api_emitir():
     """
     Espera um JSON com todos os dados do boleto + campo 'user'
-
     Exemplo:
     {
         "user": "email@cliente.com",
-
-        # OPCIONAIS (se não enviar, usa da tabela certifica_sicoob)
         "numeroCliente": 409987,
-        "numeroContaCorrente": 50300,
-
+        "numeroContaCorrente": 50300,   # se não vier, usamos 'conta' da certifica_sicoob
         "codigoModalidade": 1,
         "numeroParcela": 1,
         "seuNumero": "1",
@@ -306,41 +297,39 @@ def api_emitir():
         ...
     }
 
-    Se "numeroCliente" NÃO for enviado, o backend usa o "cliente_id"
-    da tabela certifica_sicoob, vinculado a esse user (também usado
-    como client_id do OAuth).
+    - O 'user' é usado para:
+      * puxar pem/key/cliente_id/conta da certifica_sicoob
+      * gerar o TOKEN com o client_id correto
+      * opcionalmente garantir numeroContaCorrente a partir da coluna 'conta'
     """
     payload = request.get_json(silent=True) or {}
 
     user = payload.get("user")
-    # Remove "user" antes de mandar pro Sicoob
+    # não vai para o Sicoob
     payload.pop("user", None)
 
-    cert_files, cliente_id, conta, erro_cert = carregar_certificados_local(user)
+    cert_files, cliente_id_oauth, conta_corrente, erro_cert = carregar_certificados_local(user)
     if erro_cert:
         return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
 
-    # Se numeroCliente não enviado no payload, tenta usar cliente_id do Supabase
-    if not payload.get("numeroCliente") and cliente_id:
+    # Se tiver conta corrente cadastrada na tabela, garantimos que o payload use essa conta
+    if conta_corrente is not None:
         try:
-            payload["numeroCliente"] = int(str(cliente_id))
+            payload["numeroContaCorrente"] = int(conta_corrente)
         except ValueError:
-            # Se der erro de conversão, manda como texto mesmo
-            payload["numeroCliente"] = cliente_id
+            # se por acaso veio lixo no banco
+            return jsonify({
+                "ok": False,
+                "etapa": "certificado",
+                "erro": f"Valor inválido em certifica_sicoob.conta: {conta_corrente}"
+            }), 500
 
-    # Se numeroContaCorrente não enviado, usamos 'conta' da tabela certifica_sicoob
-    if not payload.get("numeroContaCorrente") and conta is not None:
-        try:
-            payload["numeroContaCorrente"] = int(str(conta))
-        except ValueError:
-            # se vier zoado, deixa sem (Sicoob vai acusar no erro)
-            pass
-
-    # Gera token usando cliente_id como client_id do OAuth (dinâmico)
-    token, erro_tk = gerar_token_sicoob(cert_files, cliente_id)
+    # Gera token com client_id dinâmico (cliente_id da certifica_sicoob)
+    token, erro_tk = gerar_token_sicoob(cert_files, cliente_id_oauth)
     if erro_tk:
         return jsonify({"ok": False, "etapa": "token", "erro": erro_tk}), 500
 
+    # Emite boleto
     result, erro_bolet = emitir_boleto_sicoob(token, payload, cert_files)
     if erro_bolet:
         return jsonify({"ok": False, "etapa": "boleto", "erro": erro_bolet}), 500
@@ -361,36 +350,33 @@ def api_pdf():
     Espera um JSON:
     {
         "user": "email@cliente.com",
-
         "numeroContratoCobranca": 123,
         "nossoNumero": 456,
-
-        # OPCIONAL: se não mandar, usa cliente_id da tabela certifica_sicoob
-        "numeroCliente": 409987,
-
+        "numeroCliente": 409987,        # OBRIGATÓRIO aqui
         "codigoModalidade": 1
     }
+
+    - 'user' é usado para achar o certificado e client_id OAuth.
+    - 'numeroCliente' é OBRIGATÓRIO no body; não vamos mais usar cliente_id do banco
+      como fallback aqui, porque agora cliente_id é CLIENT_ID OAuth (GUID).
     """
     dados = request.get_json(silent=True) or {}
 
     user = dados.get("user")
-    # "user" só para achar o certificado e o cliente_id
-    cert_files, cliente_id, conta, erro_cert = carregar_certificados_local(user)
+    numero_cliente = dados.get("numeroCliente")
+    if numero_cliente is None:
+        return jsonify({"erro": "numeroCliente é obrigatório para baixar o PDF"}), 400
+
+    cert_files, cliente_id_oauth, _, erro_cert = carregar_certificados_local(user)
     if erro_cert:
         return jsonify({"erro": erro_cert}), 500
 
-    # Decide o numeroCliente
-    num_cliente = dados.get("numeroCliente") or cliente_id
-    if not num_cliente:
-        return jsonify({"erro": "numeroCliente não informado e cliente_id não encontrado para este usuário"}), 400
-
     try:
-        num_cliente_int = int(str(num_cliente))
+        num_cliente_int = int(str(numero_cliente))
     except ValueError:
-        return jsonify({"erro": f"numeroCliente/cliente_id inválido: {num_cliente}"}), 400
+        return jsonify({"erro": f"numeroCliente inválido: {numero_cliente}"}), 400
 
-    # Token também usa cliente_id como client_id do OAuth
-    token, erro_tk = gerar_token_sicoob(cert_files, cliente_id)
+    token, erro_tk = gerar_token_sicoob(cert_files, cliente_id_oauth)
     if erro_tk:
         return jsonify({"erro": erro_tk}), 500
 
