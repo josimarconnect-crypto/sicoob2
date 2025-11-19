@@ -33,7 +33,8 @@ SUPABASE_KEY = os.environ.get(
 # {
 #   "user@dominio.com": {
 #       "cert": (cert_path, key_path),
-#       "cliente_id": "409987"
+#       "cliente_id": "409987",
+#       "conta": 50300
 #   }
 # }
 CERT_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -43,17 +44,19 @@ CERT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def carregar_certificados_local(
     user: Optional[str] = None
-) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[str]]:
+) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[int], Optional[str]]:
     """
     Busca o último certificado salvo na tabela certifica_sicoob.
     Se 'user' for informado, filtra pelos registros daquele usuário.
     Campos:
       - pem (base64)
       - key (base64)
-      - cliente_id (text)  -> númeroCliente do Sicoob
+      - cliente_id (text)  -> numeroCliente do Sicoob
+      - conta (bigint)     -> numeroContaCorrente
       - user (text)
+
     Retorna:
-      ( (cert_path, key_path), cliente_id, erro )
+      ( (cert_path, key_path), cliente_id, conta, erro )
     """
 
     global CERT_CACHE
@@ -63,14 +66,14 @@ def carregar_certificados_local(
     # Se já está em cache, reaproveita
     if cache_key in CERT_CACHE:
         info = CERT_CACHE[cache_key]
-        return info["cert"], info.get("cliente_id"), None
+        return info["cert"], info.get("cliente_id"), info.get("conta"), None
 
     if not SUPABASE_KEY:
-        return None, None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
+        return None, None, None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
 
     # Monta parâmetros da consulta
     params = {
-        "select": "pem,key,cliente_id",
+        "select": "pem,key,cliente_id,conta",
         "order": "id.desc",
         "limit": "1",
     }
@@ -90,33 +93,34 @@ def carregar_certificados_local(
             timeout=20,
         )
     except Exception as e:
-        return None, None, f"Erro ao chamar Supabase: {e}"
+        return None, None, None, f"Erro ao chamar Supabase: {e}"
 
     if not resp.ok:
-        return None, None, f"Erro Supabase. Status={resp.status_code}, texto={resp.text}"
+        return None, None, None, f"Erro Supabase. Status={resp.status_code}, texto={resp.text}"
 
     try:
         rows: List[Dict[str, Any]] = resp.json()
     except ValueError:
-        return None, None, f"Resposta inválida do Supabase: {resp.text}"
+        return None, None, None, f"Resposta inválida do Supabase: {resp.text}"
 
     if not rows:
-        return None, None, "Nenhum certificado encontrado para este usuário"
+        return None, None, None, "Nenhum certificado encontrado para este usuário"
 
     row = rows[0]
     pem_b64 = row.get("pem")
     key_b64 = row.get("key")
     cliente_id = row.get("cliente_id")
+    conta = row.get("conta")
 
     if not pem_b64 or not key_b64:
-        return None, None, "Campos pem/key vazios"
+        return None, None, None, "Campos pem/key vazios"
 
     # Decodificar base64
     try:
         pem_bytes = base64.b64decode(pem_b64)
         key_bytes = base64.b64decode(key_b64)
     except Exception as e:
-        return None, None, f"Erro ao decodificar base64: {e}"
+        return None, None, None, f"Erro ao decodificar base64: {e}"
 
     # Criar arquivos temporários .pem e .key
     try:
@@ -129,19 +133,20 @@ def carregar_certificados_local(
             f.write(key_bytes)
 
     except Exception as e:
-        return None, None, f"Erro ao criar arquivos temporários: {e}"
+        return None, None, None, f"Erro ao criar arquivos temporários: {e}"
 
     CERT_CACHE[cache_key] = {
         "cert": (cert_path, key_path),
         "cliente_id": cliente_id,
+        "conta": conta,
     }
 
     print(
         f"✔ Certificado carregado do Supabase para {cache_key}: "
-        f"{CERT_CACHE[cache_key]['cert']} | cliente_id={cliente_id}"
+        f"{CERT_CACHE[cache_key]['cert']} | cliente_id={cliente_id} | conta={conta}"
     )
 
-    return CERT_CACHE[cache_key]["cert"], cliente_id, None
+    return CERT_CACHE[cache_key]["cert"], cliente_id, conta, None
 
 
 # ===================== TOKEN SICOOB ======================
@@ -263,7 +268,7 @@ def baixar_pdf_boleto(
 
 @app.get("/")
 def home():
-    return "API Sicoob (Flask) — certificado e cliente_id vindos do Supabase por usuário."
+    return "API Sicoob (Flask) — certificado, cliente_id e conta (numeroContaCorrente) vindos do Supabase por usuário."
 
 
 @app.post("/sicoob/emitir")
@@ -273,7 +278,11 @@ def api_emitir():
     Exemplo:
     {
         "user": "email@cliente.com",
-        "numeroContaCorrente": 218812,
+
+        # OPCIONAIS (se não vierem, o backend pega do Supabase):
+        "numeroCliente": 409987,
+        "numeroContaCorrente": 50300,
+
         "codigoModalidade": 1,
         "numeroParcela": 1,
         "seuNumero": "1",
@@ -283,8 +292,9 @@ def api_emitir():
         ...
     }
 
-    Se "numeroCliente" NÃO for enviado, o backend usa o "cliente_id"
-    da tabela certifica_sicoob, vinculado a esse user.
+    Se "numeroCliente" / "numeroContaCorrente" NÃO forem enviados,
+    o backend usa os campos cliente_id e conta da tabela certifica_sicoob,
+    vinculado a esse user.
     """
     payload = request.get_json(silent=True) or {}
 
@@ -292,17 +302,25 @@ def api_emitir():
     # Remove "user" antes de mandar pro Sicoob
     payload.pop("user", None)
 
-    cert_files, cliente_id, erro_cert = carregar_certificados_local(user)
+    cert_files, cliente_id, conta_corrente, erro_cert = carregar_certificados_local(user)
     if erro_cert:
         return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
 
-    # Se numeroCliente não enviado no payload, tenta usar cliente_id do Supabase
+    # ===== numeroCliente dinâmico (cliente_id da tabela) =====
     if not payload.get("numeroCliente") and cliente_id:
         try:
             payload["numeroCliente"] = int(str(cliente_id))
         except ValueError:
-            # Se der erro de conversão, manda como está (string) — o Sicoob vai acusar se estiver inválido
+            # Se der erro de conversão, manda como está (string)
             payload["numeroCliente"] = cliente_id
+
+    # ===== numeroContaCorrente dinâmico (conta da tabela) =====
+    if not payload.get("numeroContaCorrente") and conta_corrente is not None:
+        try:
+            payload["numeroContaCorrente"] = int(str(conta_corrente))
+        except ValueError:
+            # Se vier algo estranho do Supabase, deixa como está
+            payload["numeroContaCorrente"] = conta_corrente
 
     token, erro_tk = gerar_token_sicoob(cert_files)
     if erro_tk:
@@ -340,8 +358,8 @@ def api_pdf():
     dados = request.get_json(silent=True) or {}
 
     user = dados.get("user")
-    # "user" só para achar o certificado e o cliente_id
-    cert_files, cliente_id, erro_cert = carregar_certificados_local(user)
+    # "user" só para achar o certificado e o cliente_id/conta
+    cert_files, cliente_id, _conta, erro_cert = carregar_certificados_local(user)
     if erro_cert:
         return jsonify({"erro": erro_cert}), 500
 
