@@ -29,8 +29,8 @@ SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inc
 # ===================== CONFIG SUPABASE ====================
 # ==========================================================
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://hysrxadnigzqadnlkynq.supabase.co")
-SUPABASE_KEY = os.environ.get("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA")  # << use Service Role no Render!
+SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"  # << use Service Role no Render!
 
 # cache por usuário:
 # {
