@@ -14,119 +14,31 @@ app = Flask(__name__)
 CORS(app)
 
 # ==========================================================
-# ===================== CONFIG SICOOB ======================
-# ==========================================================
-
-SICOOB_TOKEN_URL = "https://auth.sicoob.com.br/auth/realms/cooperado/protocol/openid-connect/token"
-SICOOB_BASE_URL = "https://api.sicoob.com.br/cobranca-bancaria/v3"
-SICOOB_BOLETO_URL = f"{SICOOB_BASE_URL}/boletos"
-SICOOB_SEGUNDA_VIA_URL = f"{SICOOB_BASE_URL}/boletos/segunda-via"
-
-CLIENT_ID_DEFAULT = "ca417614-7d6f-4f89-ba39-f18ea496431e"
-SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inclusao"
-
-# ==========================================================
 # ===================== CONFIG SUPABASE ====================
 # ==========================================================
 
 SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"  # << use Service Role no Render!
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
 
-# cache por usuário:
-# {
-#   "user@dominio.com": {
-#       "cert": (cert_path, key_path),
-#       "cliente_id": "<CLIENT_ID OAuth>",
-#       "conta": 50300
-#   }
-# }
-CERT_CACHE: Dict[str, Dict[str, Any]] = {}
-
-# ==========================================================
-# ===================== HTCHAT CONFIG ======================
-# ==========================================================
-
-HTCHAT_DEFAULT_URL = os.environ.get("HTCHAT_URL", "https://htchat.idealcontabilidade.net:443/graphql_api")
-HTCHAT_DEFAULT_TOKEN = os.environ.get("HTCHAT_TOKEN", "")  # opcional; pode vir no body também
-
-SEND_TEXT = """
-mutation send_text(
-  $recipient: String!
-  $message: String!
-  $tipo: String!
-  $sender_name: String
-) {
-  partner_api_send_message(
-    recipient: $recipient
-    message: $message
-    tipo: $tipo
-    sender_name: $sender_name
-  ) {
-    ack api_id id message msg_id recipient sender_name tipo
-  }
-}
-""".strip()
-
-SEND_FILE = """
-mutation send_file(
-  $recipient: String!
-  $message: String
-  $tipo: String!
-  $sender_name: String
-  $file: Upload!
-) {
-  partner_api_send_message(
-    recipient: $recipient
-    message: $message
-    tipo: $tipo
-    sender_name: $sender_name
-    file: $file
-  ) {
-    ack api_id
-    arquivo { eurl extensao id mime nome }
-    id message msg_id recipient sender_name tipo
-  }
-}
-""".strip()
-
-QUERY_GET_SENDED = """
-query get_sended($id: Int!) {
-  partner_api_get_sended(id: $id) {
-    ack api_id id message msg_id recipient sender_name tipo
-    arquivo { eurl extensao id mime nome }
-  }
-}
-""".strip()
-
-# ==========================================================
-# ===================== SUPABASE HELPERS ===================
-# ==========================================================
-
-def sb_headers():
-    if not SUPABASE_KEY:
-        return None
-    return {
+def sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    h = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
     }
+    if extra:
+        h.update(extra)
+    return h
 
 def sb_insert_htchat(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Insere na tabela htchat e retorna a linha inserida (se prefer=return=representation).
-    Campos esperados:
-      number, mensagem, anexo, idms, status, user
+    Insere na tabela htchat.
+    Você criou a coluna 'numero'. Eu preencho 'numero' e também 'number' (se existir).
     """
-    h = sb_headers()
-    if not h:
-        return None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
-    h2 = dict(h)
-    h2["Prefer"] = "return=representation"
-
     try:
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/htchat",
-            headers=h2,
+            headers=sb_headers({"Prefer": "return=representation"}),
             data=json.dumps(row, ensure_ascii=False),
             timeout=20,
         )
@@ -138,7 +50,6 @@ def sb_insert_htchat(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Opt
 
     try:
         data = r.json()
-        # supabase retorna lista
         if isinstance(data, list) and data:
             return data[0], None
         return {"_raw": data}, None
@@ -149,19 +60,12 @@ def sb_update_htchat_status_by_idms(idms: str, status: str) -> Optional[str]:
     """
     Atualiza htchat.status filtrando por idms.
     """
-    h = sb_headers()
-    if not h:
-        return "SUPABASE_SERVICE_ROLE_KEY não configurada"
-
-    params = {"idms": f"eq.{idms}"}
-    body = {"status": status}
-
     try:
         r = requests.patch(
             f"{SUPABASE_URL}/rest/v1/htchat",
-            headers=h,
-            params=params,
-            data=json.dumps(body, ensure_ascii=False),
+            headers=sb_headers(),
+            params={"idms": f"eq.{idms}"},
+            data=json.dumps({"status": status}, ensure_ascii=False),
             timeout=20,
         )
     except Exception as e:
@@ -169,56 +73,42 @@ def sb_update_htchat_status_by_idms(idms: str, status: str) -> Optional[str]:
 
     if not r.ok:
         return f"Erro Supabase update htchat. Status={r.status_code}, texto={r.text}"
-
     return None
 
+
 # ==========================================================
-# =========== CARREGAR CERTIFICADO + CLIENT_ID + CONTA =====
+# ===================== CONFIG SICOOB ======================
 # ==========================================================
 
-def carregar_certificados_local(
-    user: Optional[str] = None
-) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[int], Optional[str]]:
+SICOOB_TOKEN_URL = "https://auth.sicoob.com.br/auth/realms/cooperado/protocol/openid-connect/token"
+SICOOB_BASE_URL = "https://api.sicoob.com.br/cobranca-bancaria/v3"
+SICOOB_BOLETO_URL = f"{SICOOB_BASE_URL}/boletos"
+SICOOB_SEGUNDA_VIA_URL = f"{SICOOB_BASE_URL}/boletos/segunda-via"
+
+CLIENT_ID_DEFAULT = "ca417614-7d6f-4f89-ba39-f18ea496431e"
+SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inclusao"
+
+CERT_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[int], Optional[str]]:
     """
-    Busca o último certificado salvo na tabela certifica_sicoob.
-    Se 'user' for informado, filtra pelos registros daquele usuário.
-
-    Tabela certifica_sicoob:
-      - pem (text, base64)
-      - key (text, base64)
-      - cliente_id (text)  -> CLIENT_ID OAuth do Sicoob
-      - conta (bigint)     -> número da conta corrente
-      - user (text)
-
-    Retorna:
-      ( (cert_path, key_path), cliente_id, conta, erro )
+    Busca o último certificado na certifica_sicoob e cria arquivos temporários PEM/KEY.
+    Retorna (cert_files, cliente_id_oauth, conta, erro)
     """
-
     global CERT_CACHE
     cache_key = user or "_default"
-
     if cache_key in CERT_CACHE:
         info = CERT_CACHE[cache_key]
         return info["cert"], info.get("cliente_id"), info.get("conta"), None
 
-    if not SUPABASE_KEY:
-        return None, None, None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
-
-    params = {
-        "select": "pem,key,cliente_id,conta",
-        "order": "id.desc",
-        "limit": "1",
-    }
+    params = {"select": "pem,key,cliente_id,conta", "order": "id.desc", "limit": "1"}
     if user:
         params["user"] = f"eq.{user}"
 
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/certifica_sicoob",
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
             params=params,
             timeout=20,
         )
@@ -254,7 +144,6 @@ def carregar_certificados_local(
     try:
         cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
         key_fd, key_path = tempfile.mkstemp(suffix=".key")
-
         with os.fdopen(cert_fd, "wb") as f:
             f.write(pem_bytes)
         with os.fdopen(key_fd, "wb") as f:
@@ -262,38 +151,14 @@ def carregar_certificados_local(
     except Exception as e:
         return None, None, None, f"Erro ao criar arquivos temporários: {e}"
 
-    CERT_CACHE[cache_key] = {
-        "cert": (cert_path, key_path),
-        "cliente_id": cliente_id,
-        "conta": conta,
-    }
-
-    print(
-        f"✔ Certificado carregado do Supabase para {cache_key}: "
-        f"{CERT_CACHE[cache_key]['cert']} | cliente_id={cliente_id} | conta={conta}"
-    )
-
+    CERT_CACHE[cache_key] = {"cert": (cert_path, key_path), "cliente_id": cliente_id, "conta": conta}
     return CERT_CACHE[cache_key]["cert"], cliente_id, conta, None
 
-# ==========================================================
-# ================= TOKEN SICOOB (CLIENT_ID DINÂMICO) ======
-# ==========================================================
-
-def gerar_token_sicoob(
-    cert_files: Tuple[str, str],
-    client_id_from_db: Optional[str]
-):
+def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[str]):
     cert_path, key_path = cert_files
     client_id = client_id_from_db or CLIENT_ID_DEFAULT
 
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "scope": SICOOB_SCOPE,
-    }
-
-    print(">> TOKEN: usando client_id =", client_id)
-
+    data = {"grant_type": "client_credentials", "client_id": client_id, "scope": SICOOB_SCOPE}
     try:
         resp = requests.post(
             SICOOB_TOKEN_URL,
@@ -319,13 +184,8 @@ def gerar_token_sicoob(
 
     return token, None
 
-# ==========================================================
-# ===================== EMITIR BOLETO ======================
-# ==========================================================
-
 def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[str, str]):
     cert_path, key_path = cert_files
-
     try:
         resp = requests.post(
             SICOOB_BOLETO_URL,
@@ -347,20 +207,8 @@ def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[st
 
     return j, None
 
-# ==========================================================
-# ===================== BAIXAR PDF (SEGUNDA VIA) ===========
-# ==========================================================
-
-def baixar_pdf_boleto(
-    token: str,
-    n_contrato: int,
-    n_nosso: int,
-    n_cliente: int,
-    modalidade: int,
-    cert_files: Tuple[str, str]
-):
+def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int, modalidade: int, cert_files: Tuple[str, str]):
     cert_path, key_path = cert_files
-
     params = {
         "numeroCliente": n_cliente,
         "codigoModalidade": modalidade,
@@ -368,7 +216,6 @@ def baixar_pdf_boleto(
         "numeroContratoCobranca": n_contrato,
         "gerarPdf": "true"
     }
-
     try:
         resp = requests.get(
             SICOOB_SEGUNDA_VIA_URL,
@@ -399,6 +246,19 @@ def baixar_pdf_boleto(
 
     return pdf_bytes, None
 
+
+# ==========================================================
+# ===================== HTCHAT QUERIES =====================
+# ==========================================================
+
+QUERY_RECIPIENT_EXISTS = """
+query recipient_exists($recipient: String!, $api_id: String) {
+  partner_api_recipient_exists(recipient: $recipient, api_id: $api_id) {
+    recipient
+  }
+}
+""".strip()
+
 # ==========================================================
 # ===================== HTCHAT HELPERS =====================
 # ==========================================================
@@ -408,6 +268,23 @@ def safe_json(resp: requests.Response):
         return resp.json()
     except Exception:
         return {"_raw": resp.text}
+
+def pick_first(v):
+    if isinstance(v, list):
+        return v[0] if v else {}
+    if isinstance(v, dict):
+        return v
+    return {}
+
+def normalize_recipient(recipient: str) -> str:
+    r = (recipient or "").strip()
+    if not r:
+        return ""
+    if "@s.whatsapp.net" in r:
+        return r
+    if r.isdigit():
+        return f"{r}@s.whatsapp.net"
+    return r
 
 def graphql_json(url, token, query, variables, verify_ssl=True, timeout=30):
     headers = {"token": token}
@@ -419,135 +296,218 @@ def graphql_json(url, token, query, variables, verify_ssl=True, timeout=30):
         timeout=timeout,
     )
 
-def upload_standard_opsmap(
-    url: str,
-    token: str,
-    variables: Dict[str, Any],
-    file_bytes: bytes,
-    filename: str,
-    mime: Optional[str] = None,
-    verify_ssl: bool = True,
-    timeout: int = 120
-):
-    """
-    Standard GraphQL multipart (operations/map), enviando operations/map como parts
-    e arquivo como part "0" (padrão).
-    """
-    headers = {"token": token}
+# ---------- Upload variants (como no seu tester) ----------
 
+def upload_standard_opsmap(url, token, variables, file_path, key="0", map_path="variables.file",
+                           ops_in="files", verify_ssl=True, timeout=120):
+    headers = {"token": token}
     vars2 = dict(variables)
     vars2["file"] = None
 
     operations = json.dumps({"query": SEND_FILE, "variables": vars2}, ensure_ascii=False)
-    file_map = json.dumps({"0": ["variables.file"]}, ensure_ascii=False)
+    file_map = json.dumps({key: [map_path]}, ensure_ascii=False)
 
-    if not mime:
-        mime, _ = mimetypes.guess_type(filename)
+    filename = os.path.basename(file_path)
+    mime, _ = mimetypes.guess_type(file_path)
     if not mime:
         mime = "application/octet-stream"
 
-    files = {
-        "operations": (None, operations, "application/json"),
-        "map": (None, file_map, "application/json"),
-        "0": (filename, io.BytesIO(file_bytes), mime),
-    }
-    return requests.post(url, headers=headers, files=files, verify=verify_ssl, timeout=timeout)
+    if ops_in == "files":
+        with open(file_path, "rb") as f:
+            files = {
+                "operations": (None, operations, "application/json"),
+                "map": (None, file_map, "application/json"),
+                key: (filename, f, mime),
+            }
+            return requests.post(url, headers=headers, files=files, verify=verify_ssl, timeout=timeout)
 
-def htchat_send_one(
-    htchat_url: str,
-    htchat_token: str,
-    item: Dict[str, Any],
-    verify_ssl: bool = True
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    data = {"operations": operations, "map": file_map}
+    with open(file_path, "rb") as f:
+        files = {key: (filename, f, mime)}
+        return requests.post(url, headers=headers, data=data, files=files, verify=verify_ssl, timeout=timeout)
+
+def upload_custom_query_variables_file(url, token, variables, file_path, verify_ssl=True, timeout=120):
+    headers = {"token": token}
+    vars2 = dict(variables)
+    vars2["file"] = None
+
+    data = {"query": SEND_FILE, "variables": json.dumps(vars2, ensure_ascii=False)}
+
+    filename = os.path.basename(file_path)
+    mime, _ = mimetypes.guess_type(file_path)
+    if not mime:
+        mime = "application/octet-stream"
+
+    with open(file_path, "rb") as f:
+        files = {"file": (filename, f, mime)}
+        return requests.post(url, headers=headers, data=data, files=files, verify=verify_ssl, timeout=timeout)
+
+def upload_custom_query_file_only(url, token, variables, file_path, verify_ssl=True, timeout=120):
+    headers = {"token": token}
+    data = {
+        "query": SEND_FILE,
+        "recipient": variables.get("recipient", ""),
+        "tipo": variables.get("tipo", ""),
+        "message": variables.get("message", ""),
+        "sender_name": variables.get("sender_name") or "",
+    }
+
+    filename = os.path.basename(file_path)
+    mime, _ = mimetypes.guess_type(file_path)
+    if not mime:
+        mime = "application/octet-stream"
+
+    with open(file_path, "rb") as f:
+        files = {"file": (filename, f, mime)}
+        return requests.post(url, headers=headers, data=data, files=files, verify=verify_ssl, timeout=timeout)
+
+def upload_simple_multipart(url, token, variables, file_path, verify_ssl=True, timeout=120):
+    headers = {"token": token}
+    data = {
+        "query": SEND_FILE,
+        "recipient": variables.get("recipient", ""),
+        "tipo": variables.get("tipo", ""),
+        "message": variables.get("message", ""),
+    }
+    if variables.get("sender_name"):
+        data["sender_name"] = variables["sender_name"]
+
+    filename = os.path.basename(file_path)
+    mime, _ = mimetypes.guess_type(file_path)
+    if not mime:
+        mime = "application/octet-stream"
+
+    with open(file_path, "rb") as f:
+        files = {"file": (filename, f, mime)}
+        return requests.post(url, headers=headers, data=data, files=files, verify=verify_ssl, timeout=timeout)
+
+def body_lower(resp: requests.Response) -> str:
+    try:
+        j = resp.json()
+    except Exception:
+        j = {"_raw": resp.text}
+    return json.dumps(j, ensure_ascii=False).lower()
+
+def send_file_bruteforce(url, token, variables, file_path, verify_ssl=True):
     """
-    Envia 1 mensagem (texto ou arquivo).
-    item esperado:
-      - recipient (string)
-      - tipo (text|document|image|audio|video)
-      - message (string)
-      - sender_name (opcional)
-      - file_b64 (opcional)  base64 do arquivo
-      - file_name (opcional)
-      - file_mime (opcional)
+    Testa vários jeitos de upload e retorna (resp, modo).
     """
-    recipient = (item.get("recipient") or "").strip()
+    attempts = []
+
+    for key in ["0", "file"]:
+        for ops_in in ["files", "data"]:
+            attempts.append((
+                f"standard ops/map | key={key} | ops_in={ops_in}",
+                lambda k=key, oi=ops_in: upload_standard_opsmap(
+                    url, token, variables, file_path,
+                    key=k, map_path="variables.file", ops_in=oi, verify_ssl=verify_ssl
+                )
+            ))
+
+    attempts.append(("custom query+variables+file", lambda: upload_custom_query_variables_file(url, token, variables, file_path, verify_ssl=verify_ssl)))
+    attempts.append(("custom query+fields+file", lambda: upload_custom_query_file_only(url, token, variables, file_path, verify_ssl=verify_ssl)))
+    attempts.append(("simple multipart", lambda: upload_simple_multipart(url, token, variables, file_path, verify_ssl=verify_ssl)))
+
+    last = None
+    for label, fn in attempts:
+        try:
+            r = fn()
+            last = (r, label)
+            b = body_lower(r)
+
+            # sucesso típico
+            if r.status_code == 200:
+                try:
+                    jj = r.json()
+                except Exception:
+                    jj = {}
+                if "errors" not in jj:
+                    return r, label
+
+            # se resposta é diferente das mensagens clássicas, pode ser útil parar aqui
+            if ("file is nil or empty" not in b) and ("http: no such file" not in b):
+                return r, label
+        except Exception:
+            continue
+
+    return last if last else (None, "Nenhum método funcionou")
+
+def htchat_parse_send_response(resp: requests.Response) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    j = safe_json(resp)
+    if resp.status_code != 200 or "errors" in j:
+        return None, f"Erro HTChat: HTTP {resp.status_code} - {j}"
+
+    data = j.get("data") or {}
+    node = pick_first(data.get("partner_api_send_message"))
+    if not node:
+        return None, f"Resposta HTChat inesperada: {j}"
+    return node, None
+
+def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], verify_ssl: bool = True) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    recipient = normalize_recipient(item.get("recipient", ""))
     tipo = (item.get("tipo") or "text").strip()
     message = item.get("message") or ""
-    sender_name = item.get("sender_name") or None
+    sender_name = item.get("sender_name") or ""
 
     if not recipient:
         return None, "recipient vazio"
 
-    # Normaliza recipient se vier só número
-    # (se você já manda com @s.whatsapp.net, mantém)
-    if "@s.whatsapp.net" not in recipient and recipient.isdigit():
-        recipient = f"{recipient}@s.whatsapp.net"
-
-    file_b64 = item.get("file_b64")
-    if file_b64:
-        # envio com arquivo
+    # arquivo via base64 no JSON
+    if item.get("file_b64"):
         file_name = item.get("file_name") or "arquivo.bin"
-        file_mime = item.get("file_mime")
-
+        file_mime = item.get("file_mime") or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
         try:
-            file_bytes = base64.b64decode(file_b64)
+            file_bytes = base64.b64decode(item["file_b64"])
         except Exception as e:
             return None, f"file_b64 inválido: {e}"
 
-        variables = {
-            "recipient": recipient,
-            "message": message if message else "",
-            "tipo": tipo,
-            "sender_name": sender_name,
+        vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
+
+        # upload padrão ops/map com bytes (sem arquivo em disco)
+        operations = json.dumps({"query": SEND_FILE, "variables": {**vars2, "file": None}}, ensure_ascii=False)
+        file_map = json.dumps({"0": ["variables.file"]}, ensure_ascii=False)
+        files = {
+            "operations": (None, operations, "application/json"),
+            "map": (None, file_map, "application/json"),
+            "0": (file_name, io.BytesIO(file_bytes), file_mime),
         }
-
         try:
-            r = upload_standard_opsmap(
-                htchat_url, htchat_token, variables,
-                file_bytes=file_bytes,
-                filename=file_name,
-                mime=file_mime,
-                verify_ssl=verify_ssl
-            )
+            resp = requests.post(htchat_url, headers={"token": htchat_token}, files=files, verify=verify_ssl, timeout=120)
         except Exception as e:
-            return None, f"Erro upload: {e}"
+            return None, f"Erro upload (bytes): {e}"
 
-        j = safe_json(r)
-        if r.status_code != 200 or "errors" in j:
-            return None, f"Erro HTChat upload: HTTP {r.status_code} - {j}"
+        return htchat_parse_send_response(resp)
 
-        node = (j.get("data") or {}).get("partner_api_send_message") or {}
+    # envio de arquivo vindo como caminho (se você decidir usar no futuro)
+    if item.get("file_path"):
+        fp = item["file_path"]
+        if not os.path.exists(fp):
+            return None, f"file_path não existe: {fp}"
+
+        vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
+        resp, mode = send_file_bruteforce(htchat_url, htchat_token, vars2, fp, verify_ssl=verify_ssl)
+        if resp is None:
+            return None, "Falha em todos os métodos de upload"
+        node, err = htchat_parse_send_response(resp)
+        if err:
+            return None, f"{err} | modo={mode}"
+        node["_upload_mode"] = mode
         return node, None
 
-    # envio só texto
-    if not message:
+    # texto
+    if not str(message).strip():
         return None, "message vazio (para texto é obrigatório)"
 
-    variables = {
-        "recipient": recipient,
-        "message": message,
-        "tipo": tipo,
-        "sender_name": sender_name,
-    }
-
     try:
-        r = graphql_json(htchat_url, htchat_token, SEND_TEXT, variables, verify_ssl=verify_ssl, timeout=30)
+        resp = graphql_json(htchat_url, htchat_token, SEND_TEXT, {
+            "recipient": recipient, "message": message, "tipo": tipo, "sender_name": sender_name
+        }, verify_ssl=verify_ssl, timeout=30)
     except Exception as e:
         return None, f"Erro HTChat texto: {e}"
 
-    j = safe_json(r)
-    if r.status_code != 200 or "errors" in j:
-        return None, f"Erro HTChat texto: HTTP {r.status_code} - {j}"
+    return htchat_parse_send_response(resp)
 
-    node = (j.get("data") or {}).get("partner_api_send_message") or {}
-    return node, None
-
-def htchat_get_sended(
-    htchat_url: str,
-    htchat_token: str,
-    msg_internal_id: int,
-    verify_ssl: bool = True
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def htchat_get_sended(htchat_url: str, htchat_token: str, msg_internal_id: int, verify_ssl: bool = True) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         r = graphql_json(htchat_url, htchat_token, QUERY_GET_SENDED, {"id": msg_internal_id}, verify_ssl=verify_ssl, timeout=30)
     except Exception as e:
@@ -557,8 +517,12 @@ def htchat_get_sended(
     if r.status_code != 200 or "errors" in j:
         return None, f"Erro HTChat get_sended: HTTP {r.status_code} - {j}"
 
-    node = (j.get("data") or {}).get("partner_api_get_sended") or {}
+    data = j.get("data") or {}
+    node = pick_first(data.get("partner_api_get_sended"))
+    if not node:
+        return None, f"Resposta get_sended inesperada: {j}"
     return node, None
+
 
 # ==========================================================
 # ===================== ROTAS ==============================
@@ -584,11 +548,7 @@ def api_emitir():
         try:
             payload["numeroContaCorrente"] = int(conta_corrente)
         except ValueError:
-            return jsonify({
-                "ok": False,
-                "etapa": "certificado",
-                "erro": f"Valor inválido em certifica_sicoob.conta: {conta_corrente}"
-            }), 500
+            return jsonify({"ok": False, "etapa": "certificado", "erro": f"Valor inválido em certifica_sicoob.conta: {conta_corrente}"}), 500
 
     token, erro_tk = gerar_token_sicoob(cert_files, cliente_id_oauth)
     if erro_tk:
@@ -636,35 +596,26 @@ def api_pdf():
     except Exception as e:
         return jsonify({"erro": f"Parâmetros numéricos inválidos: {e}"}), 400
 
-    pdf_bytes, erro_pdf = baixar_pdf_boleto(
-        token, n_contrato, n_nosso, num_cliente_int, modalidade, cert_files
-    )
+    pdf_bytes, erro_pdf = baixar_pdf_boleto(token, n_contrato, n_nosso, num_cliente_int, modalidade, cert_files)
     if erro_pdf:
         return jsonify({"erro": erro_pdf}), 500
 
-    return send_file(
-        io.BytesIO(pdf_bytes),
-        mimetype="application/pdf",
-        as_attachment=False,
-        download_name="boleto.pdf"
-    )
+    return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=False, download_name="boleto.pdf")
 
 # -------------------- HTCHAT / WHATSAPP --------------------
 
 @app.post("/htchat/send")
 def htchat_send_batch():
     """
-    Envia uma LISTA de mensagens com DELAY de 15s entre elas e salva na tabela htchat.
-
-    Body exemplo:
+    Body:
     {
       "user": "teste@gmail.com",
       "delay_seconds": 15,
       "verify_ssl": true,
-      "htchat_url": "https://.../graphql_api",     (opcional)
-      "htchat_token": "SEU_TOKEN_AQUI",            (opcional)
+      "htchat_url": "https://.../graphql_api",
+      "htchat_token": "TOKEN",
       "messages": [
-        {"recipient":"5569...","tipo":"text","message":"oi","sender_name":""},
+        {"recipient":"5569...","tipo":"text","message":"oi"},
         {"recipient":"5569...","tipo":"document","message":"segue","file_name":"a.pdf","file_mime":"application/pdf","file_b64":"..."}
       ]
     }
@@ -674,6 +625,13 @@ def htchat_send_batch():
     user = (body.get("user") or "").strip()
     if not user:
         return jsonify({"ok": False, "erro": "Campo 'user' é obrigatório"}), 400
+
+    htchat_url = (body.get("htchat_url") or "").strip()
+    htchat_token = (body.get("htchat_token") or "").strip()
+    if not htchat_url:
+        return jsonify({"ok": False, "erro": "Campo 'htchat_url' é obrigatório"}), 400
+    if not htchat_token:
+        return jsonify({"ok": False, "erro": "Campo 'htchat_token' é obrigatório"}), 400
 
     messages = body.get("messages") or []
     if not isinstance(messages, list) or not messages:
@@ -689,72 +647,58 @@ def htchat_send_batch():
 
     verify_ssl = bool(body.get("verify_ssl", True))
 
-    htchat_url = (body.get("htchat_url") or HTCHAT_DEFAULT_URL).strip()
-    htchat_token = (body.get("htchat_token") or HTCHAT_DEFAULT_TOKEN).strip()
-    if not htchat_token:
-        return jsonify({"ok": False, "erro": "HTCHAT_TOKEN não informado (env HTCHAT_TOKEN ou no body htchat_token)"}), 400
-
     results = []
     for idx, item in enumerate(messages, start=1):
-        recipient = (item.get("recipient") or "").strip()
+        recipient_norm = normalize_recipient(item.get("recipient", ""))
+        anexo_desc = item.get("file_name") or ""
 
-        # Pré-grava no Supabase como queued (idms vazio por enquanto)
-        anexo_desc = ""
-        if item.get("file_b64"):
-            anexo_desc = item.get("file_name") or "arquivo"
-
-        row = {
-            "number": recipient,
-            "mensagem": item.get("message") or "",
-            "anexo": anexo_desc,
-            "idms": "",                  # preenche depois do envio
-            "status": "queued",
-            "user": user,
-        }
-        sb_row, sb_err = sb_insert_htchat(row)
-        if sb_err:
-            # mesmo se falhar o log no supabase, tenta enviar
-            print("⚠ Falha ao inserir htchat:", sb_err)
-
-        # Envia de fato
         node, err = htchat_send_one(htchat_url, htchat_token, item, verify_ssl=verify_ssl)
 
         if err:
-            # atualiza status como erro (se tiver inserido)
-            # não temos idms; salva status genérico
-            results.append({"i": idx, "recipient": recipient, "ok": False, "erro": err})
-            continue
+            row_err = {
+                "numero": recipient_norm,
+                "number": recipient_norm,
+                "mensagem": item.get("message") or "",
+                "anexo": anexo_desc,
+                "idms": "",
+                "status": f"erro: {err}",
+                "user": user,
+            }
+            _, sb_err = sb_insert_htchat(row_err)
+            if sb_err:
+                print("⚠ Falha ao inserir erro htchat:", sb_err)
 
-        # pega id retornado pelo send_message (é o Int que você usa no get_sended)
-        msg_internal_id = node.get("id")
-        ack = node.get("ack")
+            results.append({"i": idx, "recipient": recipient_norm, "ok": False, "erro": err})
 
-        # Atualiza linha no supabase (se possível) usando idms=msg_internal_id
-        # Como inserimos idms vazio, fazemos outro patch filtrando por (user, number, mensagem, status=queued) seria arriscado.
-        # Então: inserção "best effort" e aqui fazemos um novo INSERT com idms preenchido se quiser rastreio perfeito.
-        # Para ficar simples e robusto: fazemos um NOVO INSERT "sent" com idms preenchido.
-        row2 = {
-            "number": recipient,
-            "mensagem": item.get("message") or "",
-            "anexo": anexo_desc,
-            "idms": str(msg_internal_id) if msg_internal_id is not None else "",
-            "status": f"sent_ack_{ack}" if ack is not None else "sent",
-            "user": user,
-        }
-        _, _ = sb_insert_htchat(row2)
+        else:
+            msg_internal_id = node.get("id")
+            ack = node.get("ack")
 
-        results.append({
-            "i": idx,
-            "recipient": recipient,
-            "ok": True,
-            "id": msg_internal_id,
-            "ack": ack,
-            "msg_id": node.get("msg_id"),
-            "tipo": node.get("tipo"),
-            "arquivo": node.get("arquivo"),
-        })
+            row_ok = {
+                "numero": recipient_norm,
+                "number": recipient_norm,
+                "mensagem": item.get("message") or "",
+                "anexo": anexo_desc,
+                "idms": str(msg_internal_id) if msg_internal_id is not None else "",
+                "status": f"{ack}" if ack is not None else "sent",
+                "user": user,
+            }
+            _, sb_err = sb_insert_htchat(row_ok)
+            if sb_err:
+                print("⚠ Falha ao inserir htchat:", sb_err)
 
-        # delay entre mensagens (exceto após a última)
+            results.append({
+                "i": idx,
+                "recipient": recipient_norm,
+                "ok": True,
+                "id": msg_internal_id,
+                "ack": ack,
+                "msg_id": node.get("msg_id"),
+                "tipo": node.get("tipo"),
+                "arquivo": node.get("arquivo"),
+                "upload_mode": node.get("_upload_mode"),
+            })
+
         if idx < len(messages) and delay_seconds > 0:
             time.sleep(delay_seconds)
 
@@ -762,27 +706,22 @@ def htchat_send_batch():
 
 @app.post("/htchat/status")
 def htchat_update_status():
-    """
-    Consulta o get_sended(id) e atualiza htchat.status com o ack.
-
-    Body:
-    {
-      "user": "teste@gmail.com",
-      "id": 14,
-      "verify_ssl": true,
-      "htchat_url": "...",      (opcional)
-      "htchat_token": "..."     (opcional)
-    }
-    """
     body = request.get_json(silent=True) or {}
 
     user = (body.get("user") or "").strip()
     if not user:
         return jsonify({"ok": False, "erro": "Campo 'user' é obrigatório"}), 400
 
+    htchat_url = (body.get("htchat_url") or "").strip()
+    htchat_token = (body.get("htchat_token") or "").strip()
+    if not htchat_url:
+        return jsonify({"ok": False, "erro": "Campo 'htchat_url' é obrigatório"}), 400
+    if not htchat_token:
+        return jsonify({"ok": False, "erro": "Campo 'htchat_token' é obrigatório"}), 400
+
     raw_id = body.get("id")
     if raw_id is None:
-        return jsonify({"ok": False, "erro": "Campo 'id' (Int do send_message) é obrigatório"}), 400
+        return jsonify({"ok": False, "erro": "Campo 'id' é obrigatório"}), 400
 
     try:
         msg_internal_id = int(str(raw_id))
@@ -790,10 +729,6 @@ def htchat_update_status():
         return jsonify({"ok": False, "erro": f"id inválido: {raw_id}"}), 400
 
     verify_ssl = bool(body.get("verify_ssl", True))
-    htchat_url = (body.get("htchat_url") or HTCHAT_DEFAULT_URL).strip()
-    htchat_token = (body.get("htchat_token") or HTCHAT_DEFAULT_TOKEN).strip()
-    if not htchat_token:
-        return jsonify({"ok": False, "erro": "HTCHAT_TOKEN não informado (env HTCHAT_TOKEN ou no body htchat_token)"}), 400
 
     node, err = htchat_get_sended(htchat_url, htchat_token, msg_internal_id, verify_ssl=verify_ssl)
     if err:
@@ -802,18 +737,50 @@ def htchat_update_status():
     ack = node.get("ack")
     status_str = f"{ack}" if ack is not None else "null"
 
-    # Atualiza tabela htchat pelo idms (string do id)
     up_err = sb_update_htchat_status_by_idms(str(msg_internal_id), status_str)
     if up_err:
-        # não impede retornar status
         print("⚠ Falha ao atualizar status no Supabase:", up_err)
 
     return jsonify({"ok": True, "id": msg_internal_id, "ack": ack, "updated_status": status_str, "node": node})
+
+@app.post("/htchat/recipient_exists")
+def htchat_recipient_exists():
+    body = request.get_json(silent=True) or {}
+    htchat_url = (body.get("htchat_url") or "").strip()
+    htchat_token = (body.get("htchat_token") or "").strip()
+    recipient = normalize_recipient(body.get("recipient", ""))
+    api_id = body.get("api_id")
+
+    if not htchat_url or not htchat_token or not recipient:
+        return jsonify({"ok": False, "erro": "htchat_url, htchat_token e recipient são obrigatórios"}), 400
+
+    r = graphql_json(htchat_url, htchat_token, QUERY_RECIPIENT_EXISTS,
+                    {"recipient": recipient, "api_id": api_id}, verify_ssl=bool(body.get("verify_ssl", True)))
+    return jsonify({"ok": True, "resp": safe_json(r)})
+
+@app.post("/htchat/get_sended")
+def htchat_get_sended_route():
+    body = request.get_json(silent=True) or {}
+    htchat_url = (body.get("htchat_url") or "").strip()
+    htchat_token = (body.get("htchat_token") or "").strip()
+    raw_id = body.get("id")
+
+    if not htchat_url or not htchat_token or raw_id is None:
+        return jsonify({"ok": False, "erro": "htchat_url, htchat_token e id são obrigatórios"}), 400
+
+    try:
+        mid = int(str(raw_id))
+    except Exception:
+        return jsonify({"ok": False, "erro": "id inválido"}), 400
+
+    node, err = htchat_get_sended(htchat_url, htchat_token, mid, verify_ssl=bool(body.get("verify_ssl", True)))
+    if err:
+        return jsonify({"ok": False, "erro": err}), 500
+    return jsonify({"ok": True, "node": node})
 
 # ==========================================================
 # ===================== MAIN ===============================
 # ==========================================================
 
 if __name__ == "__main__":
-    # local:
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
