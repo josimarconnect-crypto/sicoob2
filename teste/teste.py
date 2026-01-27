@@ -33,7 +33,7 @@ def sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 def sb_insert_htchat(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Insere na tabela htchat.
-    Você criou a coluna 'numero'. Eu preencho 'numero' e também 'number' (se existir).
+    Usa apenas a coluna 'numero' que já existe na tabela.
     """
     try:
         r = requests.post(
@@ -250,6 +250,59 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
 # ==========================================================
 # ===================== HTCHAT QUERIES =====================
 # ==========================================================
+
+SEND_TEXT = """
+mutation send_text($recipient: String!, $message: String!, $tipo: String, $sender_name: String) {
+  partner_api_send_message(
+    recipient: $recipient,
+    message: $message,
+    tipo: $tipo,
+    sender_name: $sender_name
+  ) {
+    id
+    ack
+    msg_id
+    tipo
+    message
+    timestamp
+    arquivo
+  }
+}
+""".strip()
+
+SEND_FILE = """
+mutation send_file($recipient: String!, $message: String, $tipo: String, $sender_name: String, $file: Upload) {
+  partner_api_send_message(
+    recipient: $recipient,
+    message: $message,
+    tipo: $tipo,
+    sender_name: $sender_name,
+    file: $file
+  ) {
+    id
+    ack
+    msg_id
+    tipo
+    message
+    timestamp
+    arquivo
+  }
+}
+""".strip()
+
+QUERY_GET_SENDED = """
+query get_sended($id: Int!) {
+  partner_api_get_sended(id: $id) {
+    id
+    ack
+    msg_id
+    tipo
+    message
+    timestamp
+    arquivo
+  }
+}
+""".strip()
 
 QUERY_RECIPIENT_EXISTS = """
 query recipient_exists($recipient: String!, $api_id: String) {
@@ -657,7 +710,6 @@ def htchat_send_batch():
         if err:
             row_err = {
                 "numero": recipient_norm,
-                "number": recipient_norm,
                 "mensagem": item.get("message") or "",
                 "anexo": anexo_desc,
                 "idms": "",
@@ -676,7 +728,6 @@ def htchat_send_batch():
 
             row_ok = {
                 "numero": recipient_norm,
-                "number": recipient_norm,
                 "mensagem": item.get("message") or "",
                 "anexo": anexo_desc,
                 "idms": str(msg_internal_id) if msg_internal_id is not None else "",
