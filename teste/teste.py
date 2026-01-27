@@ -252,7 +252,7 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
 # ==========================================================
 
 SEND_TEXT = """
-mutation send_text($recipient: String!, $message: String!, $tipo: String, $sender_name: String) {
+mutation send_text($recipient: String!, $message: String!, $tipo: String!, $sender_name: String) {
   partner_api_send_message(
     recipient: $recipient,
     message: $message,
@@ -264,14 +264,17 @@ mutation send_text($recipient: String!, $message: String!, $tipo: String, $sende
     msg_id
     tipo
     message
-    timestamp
-    arquivo
+    arquivo {
+      url
+      filename
+      mime
+    }
   }
 }
 """.strip()
 
 SEND_FILE = """
-mutation send_file($recipient: String!, $message: String, $tipo: String, $sender_name: String, $file: Upload) {
+mutation send_file($recipient: String!, $message: String, $tipo: String!, $sender_name: String, $file: Upload) {
   partner_api_send_message(
     recipient: $recipient,
     message: $message,
@@ -284,8 +287,11 @@ mutation send_file($recipient: String!, $message: String, $tipo: String, $sender
     msg_id
     tipo
     message
-    timestamp
-    arquivo
+    arquivo {
+      url
+      filename
+      mime
+    }
   }
 }
 """.strip()
@@ -298,8 +304,11 @@ query get_sended($id: Int!) {
     msg_id
     tipo
     message
-    timestamp
-    arquivo
+    arquivo {
+      url
+      filename
+      mime
+    }
   }
 }
 """.strip()
@@ -738,6 +747,15 @@ def htchat_send_batch():
             if sb_err:
                 print("⚠ Falha ao inserir htchat:", sb_err)
 
+            # Extrair informações do arquivo se existir
+            arquivo_info = ""
+            if node.get("arquivo"):
+                arquivo = node["arquivo"]
+                if isinstance(arquivo, dict):
+                    arquivo_info = f"{arquivo.get('filename') or ''} ({arquivo.get('mime') or ''})"
+                elif isinstance(arquivo, str):
+                    arquivo_info = arquivo
+
             results.append({
                 "i": idx,
                 "recipient": recipient_norm,
@@ -746,7 +764,7 @@ def htchat_send_batch():
                 "ack": ack,
                 "msg_id": node.get("msg_id"),
                 "tipo": node.get("tipo"),
-                "arquivo": node.get("arquivo"),
+                "arquivo": arquivo_info,
                 "upload_mode": node.get("_upload_mode"),
             })
 
