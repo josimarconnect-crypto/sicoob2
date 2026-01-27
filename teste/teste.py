@@ -19,7 +19,7 @@ CORS(app)
 # ==========================================================
 
 SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"  # <<< coloque sua key aqui
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
 
 def sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     h = {
@@ -34,7 +34,6 @@ def sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 def sb_insert_htchat(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Insere na tabela htchat.
-    OBS: ajuste as colunas conforme sua tabela real no Supabase.
     """
     try:
         r = requests.post(
@@ -252,7 +251,7 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
 # ===================== HTCHAT QUERIES =====================
 # ==========================================================
 # IMPORTANTE: seu schema NÃO tem arquivo.url nem arquivo.filename.
-# Use arquivo.eurl + arquivo.mime (conforme erro que você recebeu).
+# Use arquivo.eurl + arquivo.mime.
 
 SEND_TEXT = """
 mutation send_text($recipient: String!, $message: String!, $tipo: String!, $sender_name: String) {
@@ -366,6 +365,33 @@ def body_lower(resp: requests.Response) -> str:
         j = {"_raw": resp.text}
     return json.dumps(j, ensure_ascii=False).lower()
 
+def extract_arquivo_info(node: Dict[str, Any]) -> str:
+    """
+    Tratativa robusta: arquivo pode vir como dict/list/str/nulo.
+    E no schema atual: usa eurl + mime.
+    """
+    arq = node.get("arquivo")
+    if not arq:
+        return ""
+
+    if isinstance(arq, str):
+        return arq
+
+    if isinstance(arq, list):
+        arq = arq[0] if arq else None
+        if not arq:
+            return ""
+
+    if isinstance(arq, dict):
+        eurl = arq.get("eurl") or arq.get("url") or arq.get("link") or ""
+        mime = arq.get("mime") or ""
+        if eurl and mime:
+            return f"{eurl} ({mime})"
+        return eurl or mime or ""
+
+    return ""
+
+
 # ---------- Upload variants (arquivo EM DISCO) ----------
 
 def upload_standard_opsmap(url, token, variables, file_path, key="0", map_path="variables.file",
@@ -478,7 +504,6 @@ def send_file_bruteforce(url, token, variables, file_path, verify_ssl=True):
             last = (r, label)
             b = body_lower(r)
 
-            # sucesso típico
             if r.status_code == 200:
                 try:
                     jj = r.json()
@@ -487,13 +512,13 @@ def send_file_bruteforce(url, token, variables, file_path, verify_ssl=True):
                 if "errors" not in jj:
                     return r, label
 
-            # se resposta é diferente das mensagens clássicas, pode ser útil parar aqui
             if ("file is nil or empty" not in b) and ("http: no such file" not in b):
                 return r, label
         except Exception:
             continue
 
     return last if last else (None, "Nenhum método funcionou")
+
 
 def htchat_parse_send_response(resp: requests.Response) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     j = safe_json(resp)
@@ -517,31 +542,6 @@ def htchat_parse_get_response(resp: requests.Response) -> Tuple[Optional[Dict[st
         return None, f"Resposta get_sended inesperada: {j}"
     return node, None
 
-def extract_arquivo_info(node: Dict[str, Any]) -> str:
-    """
-    Tratativa robusta: arquivo pode vir como dict/list/str/nulo.
-    E no schema atual: usa eurl + mime.
-    """
-    arq = node.get("arquivo")
-    if not arq:
-        return ""
-
-    if isinstance(arq, str):
-        return arq
-
-    if isinstance(arq, list):
-        arq = arq[0] if arq else None
-        if not arq:
-            return ""
-
-    if isinstance(arq, dict):
-        eurl = arq.get("eurl") or arq.get("url") or arq.get("link") or ""
-        mime = arq.get("mime") or ""
-        if eurl and mime:
-            return f"{eurl} ({mime})"
-        return eurl or mime or ""
-
-    return ""
 
 def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], verify_ssl: bool = True) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
@@ -549,6 +549,10 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
     - Se tiver file_b64 => envia como arquivo (multipart GraphQL), message é opcional
     - Se tiver file_path => tenta upload por vários métodos (message opcional)
     - Se não tiver arquivo => envia texto (message obrigatório)
+
+    CORREÇÃO IMPORTANTE:
+    - Quando tem arquivo, HTChat NÃO aceita tipo="document" (nem outros).
+      Então forçamos tipo="text" quando houver arquivo.
     """
     recipient = normalize_recipient(item.get("recipient", ""))
     tipo = (item.get("tipo") or "text").strip()
@@ -557,6 +561,13 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
 
     if not recipient:
         return None, "recipient vazio"
+
+    has_file = bool(item.get("file_b64")) or bool(item.get("file_path"))
+
+    # ✅ CORREÇÃO: com arquivo, tipo deve ser "text"
+    orig_tipo = tipo
+    if has_file and tipo.lower() != "text":
+        tipo = "text"
 
     # ===================== COM ARQUIVO (base64) =====================
     if item.get("file_b64"):
@@ -575,7 +586,6 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
             "sender_name": sender_name,
         }
 
-        # padrão GraphQL multipart (operations/map)
         operations = json.dumps({"query": SEND_FILE, "variables": {**vars2, "file": None}}, ensure_ascii=False)
         file_map = json.dumps({"0": ["variables.file"]}, ensure_ascii=False)
         files = {
@@ -592,6 +602,8 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
         node, err = htchat_parse_send_response(resp)
         if node:
             node["_upload_mode"] = "bytes ops/map"
+            node["_tipo_original"] = orig_tipo
+            node["_tipo_enviado"] = tipo
         return node, err
 
     # ===================== COM ARQUIVO (path em disco) =====================
@@ -602,13 +614,17 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
 
         vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
         resp, mode = send_file_bruteforce(htchat_url, htchat_token, vars2, fp, verify_ssl=verify_ssl)
+
         if resp is None:
             return None, "Falha em todos os métodos de upload"
 
         node, err = htchat_parse_send_response(resp)
         if err:
             return None, f"{err} | modo={mode}"
+
         node["_upload_mode"] = mode
+        node["_tipo_original"] = orig_tipo
+        node["_tipo_enviado"] = tipo
         return node, None
 
     # ===================== SEM ARQUIVO (texto) =====================
@@ -630,14 +646,16 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
     node, err = htchat_parse_send_response(resp)
     if node:
         node["_upload_mode"] = "text"
+        node["_tipo_original"] = orig_tipo
+        node["_tipo_enviado"] = tipo
     return node, err
+
 
 def htchat_get_sended(htchat_url: str, htchat_token: str, msg_internal_id: int, verify_ssl: bool = True) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         r = graphql_json(htchat_url, htchat_token, QUERY_GET_SENDED, {"id": msg_internal_id}, verify_ssl=verify_ssl, timeout=30)
     except Exception as e:
         return None, f"Erro HTChat get_sended: {e}"
-
     return htchat_parse_get_response(r)
 
 
@@ -718,6 +736,7 @@ def api_pdf():
         return jsonify({"erro": erro_pdf}), 500
 
     return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=False, download_name="boleto.pdf")
+
 
 # -------------------- HTCHAT / WHATSAPP --------------------
 
@@ -810,8 +829,10 @@ def htchat_send_batch():
                 "ack": ack,
                 "msg_id": node.get("msg_id"),
                 "tipo": node.get("tipo"),
-                "arquivo": extract_arquivo_info(node),   # <<< TRATATIVA COM/SEM ARQUIVO
+                "arquivo": extract_arquivo_info(node),
                 "upload_mode": node.get("_upload_mode"),
+                "tipo_original": node.get("_tipo_original"),
+                "tipo_enviado": node.get("_tipo_enviado"),
             })
 
         if idx < len(messages) and delay_seconds > 0:
@@ -862,7 +883,7 @@ def htchat_update_status():
         "ack": ack,
         "updated_status": status_str,
         "node": node,
-        "arquivo": extract_arquivo_info(node),  # <<< TRATATIVA
+        "arquivo": extract_arquivo_info(node),
     })
 
 @app.post("/htchat/recipient_exists")
@@ -881,7 +902,7 @@ def htchat_recipient_exists():
         htchat_token,
         QUERY_RECIPIENT_EXISTS,
         {"recipient": recipient, "api_id": api_id},
-        verify=bool(body.get("verify_ssl", True)),
+        verify_ssl=bool(body.get("verify_ssl", True)),
     )
     return jsonify({"ok": True, "resp": safe_json(r)})
 
