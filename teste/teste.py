@@ -1,4 +1,3 @@
-# app.py
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import requests
@@ -82,16 +81,17 @@ SICOOB_SEGUNDA_VIA_URL = f"{SICOOB_BASE_URL}/boletos/segunda-via"
 CLIENT_ID_DEFAULT = "ca417614-7d6f-4f89-ba39-f18ea496431e"
 SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inclusao"
 
+# cache por user
 CERT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[int], Optional[str]]:
     """
-    certifica_sicoob: pem,key (base64), cliente_id (CLIENT_ID OAuth), conta, user
-    Retorna: ( (cert_path, key_path), cliente_id, conta, erro )
+    Busca o último certificado na certifica_sicoob e cria arquivos temporários PEM/KEY.
+    Retorna: (cert_files, cliente_id_oauth, conta, erro)
     """
     global CERT_CACHE
-
     cache_key = user or "_default"
+
     if cache_key in CERT_CACHE:
         info = CERT_CACHE[cache_key]
         return info["cert"], info.get("cliente_id"), info.get("conta"), None
@@ -169,11 +169,10 @@ def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[
     except Exception as e:
         return None, f"Erro ao chamar TOKEN: {e}"
 
-    # token sempre deve ser JSON; se não for, traz trecho do texto
     try:
         j = resp.json()
     except ValueError:
-        return None, f"Resposta TOKEN inválida (não é JSON). HTTP {resp.status_code}: {resp.text[:600]}"
+        return None, f"Resposta TOKEN inválida (não é JSON): HTTP {resp.status_code} - {resp.text[:800]}"
 
     if not resp.ok:
         return None, f"Erro Token: {j}"
@@ -199,7 +198,7 @@ def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[st
     try:
         j = resp.json()
     except Exception:
-        return None, f"Resposta inválida do Sicoob ao emitir (não é JSON). HTTP {resp.status_code}: {resp.text[:600]}"
+        return None, f"Resposta inválida do Sicoob (não é JSON): HTTP {resp.status_code} - {resp.text[:800]}"
 
     if not resp.ok:
         return None, f"Erro na emissão: {j}"
@@ -208,7 +207,8 @@ def emitir_boleto_sicoob(token: str, dados: Dict[str, Any], cert_files: Tuple[st
 
 def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int, modalidade: int, cert_files: Tuple[str, str]):
     """
-    ✅ Correção: o endpoint pode retornar JSON OU PDF direto OU HTML em erro.
+    Mantém a lógica do seu antigo, mas evita erro "vazio":
+    se não vier JSON, devolve HTTP + content-type + body (trecho).
     """
     cert_path, key_path = cert_files
     params = {
@@ -216,7 +216,7 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
         "codigoModalidade": modalidade,
         "nossoNumero": n_nosso,
         "numeroContratoCobranca": n_contrato,
-        "gerarPdf": "true",
+        "gerarPdf": "true"
     }
 
     try:
@@ -225,32 +225,28 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
             headers={"Authorization": f"Bearer {token}"},
             params=params,
             cert=(cert_path, key_path),
-            timeout=25,
+            timeout=20,
         )
     except Exception as e:
-        return None, f"Erro ao baixar PDF do boleto: {e}"
+        return None, f"Erro ao baixar PDF: {e}"
 
-    ct = (resp.headers.get("Content-Type") or "").lower()
-
-    # ✅ Se vier PDF direto
-    if "application/pdf" in ct:
-        if not resp.ok:
-            return None, f"PDF retornou erro HTTP {resp.status_code}"
-        return resp.content, None
-
-    # ✅ Tenta JSON
     try:
         data = resp.json()
     except ValueError:
-        # não é JSON -> provavelmente HTML/texto (erro do gateway)
-        return None, f"Resposta inválida ao baixar PDF (não é JSON). HTTP {resp.status_code} | Content-Type={ct} | Body={resp.text[:800]}"
+        ct = resp.headers.get("Content-Type", "")
+        txt = ""
+        try:
+            txt = resp.text or ""
+        except Exception:
+            txt = ""
+        return None, f"Resposta inválida ao baixar PDF: HTTP {resp.status_code} | CT={ct or '<sem>'} | Body={(txt[:1200] if txt else '<vazio>')}"
 
     if not resp.ok:
-        return None, f"Erro Sicoob segunda via: HTTP {resp.status_code} - {data}"
+        return None, data
 
-    pdf_b64 = (data.get("resultado", {}) or {}).get("pdfBoleto") or data.get("pdfBoleto")
+    pdf_b64 = data.get("resultado", {}).get("pdfBoleto") or data.get("pdfBoleto")
     if not pdf_b64:
-        return None, f"Campo pdfBoleto não encontrado. Retorno={data}"
+        return None, f"Campo pdfBoleto não encontrado: {data}"
 
     try:
         pdf_bytes = base64.b64decode(pdf_b64)
@@ -360,24 +356,6 @@ def graphql_json(url, token, query, variables, verify_ssl=True, timeout=30):
         timeout=timeout,
     )
 
-def extract_arquivo_info(node: Dict[str, Any]) -> str:
-    arq = node.get("arquivo")
-    if not arq:
-        return ""
-    if isinstance(arq, str):
-        return arq
-    if isinstance(arq, list):
-        arq = arq[0] if arq else None
-        if not arq:
-            return ""
-    if isinstance(arq, dict):
-        eurl = arq.get("eurl") or ""
-        mime = arq.get("mime") or ""
-        if eurl and mime:
-            return f"{eurl} ({mime})"
-        return eurl or mime or ""
-    return ""
-
 def htchat_parse_send_response(resp: requests.Response) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     j = safe_json(resp)
     if resp.status_code != 200 or "errors" in j:
@@ -398,9 +376,24 @@ def htchat_parse_get_response(resp: requests.Response) -> Tuple[Optional[Dict[st
         return None, f"Resposta get_sended inesperada: {j}"
     return node, None
 
+def extract_arquivo_info(node: Dict[str, Any]) -> str:
+    arq = node.get("arquivo")
+    if not arq:
+        return ""
+    if isinstance(arq, list):
+        arq = arq[0] if arq else None
+    if isinstance(arq, dict):
+        eurl = arq.get("eurl") or ""
+        mime = arq.get("mime") or ""
+        if eurl and mime:
+            return f"{eurl} ({mime})"
+        return eurl or mime or ""
+    if isinstance(arq, str):
+        return arq
+    return ""
+
 def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], verify_ssl: bool = True) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     recipient = normalize_recipient(item.get("recipient", ""))
-    tipo = (item.get("tipo") or "text").strip()
     message = item.get("message") or ""
     sender_name = item.get("sender_name") or ""
 
@@ -408,28 +401,33 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
         return None, "recipient vazio"
 
     has_file = bool(item.get("file_b64")) or bool(item.get("file_path"))
+    tipo = (item.get("tipo") or "text").strip()
 
-    # ✅ HTChat: com arquivo, tipo TEM que ser text
+    # ✅ FIX: HTChat com arquivo exige tipo "text"
     if has_file:
         tipo = "text"
 
-    # ---------- arquivo via base64 ----------
+    # ----------- arquivo via base64 (bytes) -----------
     if item.get("file_b64"):
         file_name = item.get("file_name") or "arquivo.bin"
         file_mime = item.get("file_mime") or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
         try:
             file_bytes = base64.b64decode(item["file_b64"])
         except Exception as e:
             return None, f"file_b64 inválido: {e}"
 
         vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
+
         operations = json.dumps({"query": SEND_FILE, "variables": {**vars2, "file": None}}, ensure_ascii=False)
         file_map = json.dumps({"0": ["variables.file"]}, ensure_ascii=False)
+
         files = {
             "operations": (None, operations, "application/json"),
             "map": (None, file_map, "application/json"),
             "0": (file_name, io.BytesIO(file_bytes), file_mime),
         }
+
         try:
             resp = requests.post(htchat_url, headers={"token": htchat_token}, files=files, verify=verify_ssl, timeout=120)
         except Exception as e:
@@ -440,7 +438,7 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
             node["_upload_mode"] = "bytes ops/map"
         return node, err
 
-    # ---------- texto ----------
+    # ----------- texto -----------
     if not str(message).strip():
         return None, "message vazio (para texto é obrigatório)"
 
@@ -484,7 +482,7 @@ def api_emitir():
     if erro_cert:
         return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
 
-    # garante conta corrente do banco (se existir)
+    # garante conta da tabela
     if conta_corrente is not None:
         try:
             payload["numeroContaCorrente"] = int(conta_corrente)
@@ -523,22 +521,19 @@ def api_pdf():
 
     try:
         num_cliente_int = int(str(numero_cliente))
-    except ValueError:
-        return jsonify({"erro": f"numeroCliente inválido: {numero_cliente}"}), 400
-
-    token, erro_tk = gerar_token_sicoob(cert_files, cliente_id_oauth)
-    if erro_tk:
-        return jsonify({"erro": erro_tk}), 500
-
-    try:
         n_contrato = int(str(dados.get("numeroContratoCobranca")))
         n_nosso = int(str(dados.get("nossoNumero")))
         modalidade = int(str(dados.get("codigoModalidade")))
     except Exception as e:
         return jsonify({"erro": f"Parâmetros numéricos inválidos: {e}"}), 400
 
+    token, erro_tk = gerar_token_sicoob(cert_files, cliente_id_oauth)
+    if erro_tk:
+        return jsonify({"erro": erro_tk}), 500
+
     pdf_bytes, erro_pdf = baixar_pdf_boleto(token, n_contrato, n_nosso, num_cliente_int, modalidade, cert_files)
     if erro_pdf:
+        print("❌ ERRO /sicoob/pdf:", erro_pdf)
         return jsonify({"erro": erro_pdf}), 500
 
     return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=False, download_name="boleto.pdf")
@@ -548,6 +543,20 @@ def api_pdf():
 
 @app.post("/htchat/send")
 def htchat_send_batch():
+    """
+    Body:
+    {
+      "user": "teste@gmail.com",
+      "delay_seconds": 15,
+      "verify_ssl": true,
+      "htchat_url": "https://.../graphql_api",
+      "htchat_token": "TOKEN",
+      "messages": [
+        {"recipient":"5569...","tipo":"text","message":"oi"},
+        {"recipient":"5569...","tipo":"text","message":"segue","file_name":"a.pdf","file_mime":"application/pdf","file_b64":"..."}
+      ]
+    }
+    """
     body = request.get_json(silent=True) or {}
 
     user = (body.get("user") or "").strip()
@@ -578,7 +587,7 @@ def htchat_send_batch():
     results = []
     for idx, item in enumerate(messages, start=1):
         recipient_norm = normalize_recipient(item.get("recipient", ""))
-        anexo_desc = item.get("file_name") or item.get("file_path") or ""
+        anexo_desc = item.get("file_name") or ""
 
         node, err = htchat_send_one(htchat_url, htchat_token, item, verify_ssl=verify_ssl)
 
@@ -630,6 +639,7 @@ def htchat_send_batch():
 
     return jsonify({"ok": True, "delay_seconds": delay_seconds, "results": results})
 
+
 @app.post("/htchat/status")
 def htchat_update_status():
     body = request.get_json(silent=True) or {}
@@ -669,6 +679,7 @@ def htchat_update_status():
 
     return jsonify({"ok": True, "id": msg_internal_id, "ack": ack, "updated_status": status_str, "node": node})
 
+
 @app.post("/htchat/recipient_exists")
 def htchat_recipient_exists():
     body = request.get_json(silent=True) or {}
@@ -680,9 +691,13 @@ def htchat_recipient_exists():
     if not htchat_url or not htchat_token or not recipient:
         return jsonify({"ok": False, "erro": "htchat_url, htchat_token e recipient são obrigatórios"}), 400
 
-    r = graphql_json(htchat_url, htchat_token, QUERY_RECIPIENT_EXISTS,
-                    {"recipient": recipient, "api_id": api_id}, verify_ssl=bool(body.get("verify_ssl", True)))
+    r = graphql_json(
+        htchat_url, htchat_token, QUERY_RECIPIENT_EXISTS,
+        {"recipient": recipient, "api_id": api_id},
+        verify_ssl=bool(body.get("verify_ssl", True))
+    )
     return jsonify({"ok": True, "resp": safe_json(r)})
+
 
 @app.post("/htchat/get_sended")
 def htchat_get_sended_route():
@@ -703,6 +718,7 @@ def htchat_get_sended_route():
     if err:
         return jsonify({"ok": False, "erro": err}), 500
     return jsonify({"ok": True, "node": node})
+
 
 # ==========================================================
 # ===================== MAIN ===============================
