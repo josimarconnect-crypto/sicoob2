@@ -8,6 +8,7 @@ import base64
 import json
 import mimetypes
 import time
+import binascii
 from typing import Dict, Any, Tuple, Optional, List
 
 app = Flask(__name__)
@@ -320,6 +321,43 @@ query recipient_exists($recipient: String!, $api_id: String) {
 
 
 # ==========================================================
+# ===================== UTILS BASE64 =======================
+# ==========================================================
+
+def decode_b64_to_bytes(b64_str: str) -> bytes:
+    """
+    Decodifica string base64 para bytes de forma robusta.
+    Remove prefixos 'data:*;base64,' e corrige padding.
+    """
+    if not b64_str:
+        return b""
+
+    # remove prefixos se vierem por engano
+    if "base64," in b64_str:
+        b64_str = b64_str.split("base64,", 1)[1]
+
+    b64_str = b64_str.strip()
+
+    # remove espaços e quebras de linha
+    b64_str = b64_str.replace("\n", "").replace("\r", "").replace(" ", "")
+
+    # corrige padding
+    missing = (-len(b64_str)) % 4
+    if missing:
+        b64_str += "=" * missing
+
+    try:
+        # tenta com validação primeiro
+        return base64.b64decode(b64_str, validate=True)
+    except binascii.Error:
+        # fallback sem validate (alguns base64 vêm com caracteres inválidos)
+        try:
+            return base64.b64decode(b64_str)
+        except Exception as e:
+            raise ValueError(f"Falha ao decodificar base64: {e}")
+
+
+# ==========================================================
 # ===================== HTCHAT HELPERS =====================
 # ==========================================================
 
@@ -413,9 +451,14 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
         file_mime = item.get("file_mime") or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
 
         try:
-            file_bytes = base64.b64decode(item["file_b64"])
+            # ✅ CORREÇÃO: Usa decode_b64_to_bytes robusto
+            file_bytes = decode_b64_to_bytes(item["file_b64"])
         except Exception as e:
             return None, f"file_b64 inválido: {e}"
+
+        # ✅ Validação rápida para PDF
+        if file_mime == "application/pdf" and not file_bytes.startswith(b"%PDF"):
+            print(f"⚠️ Aviso: Arquivo {file_name} não parece PDF válido (ausência de %PDF).")
 
         vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
 
