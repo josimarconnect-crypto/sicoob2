@@ -465,32 +465,43 @@ def carregar_certificado_danfse(user: str) -> Tuple[Optional[Tuple[str, str]], O
         cert_mgr.cleanup()
         return None, str(e)
 
-def gerar_danfse_pdf(xml_content: str, cert_files: Tuple[str, str]) -> Tuple[Optional[bytes], Optional[str]]:
+def gerar_danfse_pdf(xml_content: str, cert_files: Tuple[str, str], metadata: Optional[Dict[str, Any]] = None) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Gera DANFSE PDF a partir do XML usando o serviço externo.
     
     Args:
         xml_content: Conteúdo do XML da NFS-e
         cert_files: Tupla (cert_path, key_path) do certificado DANFSE
+        metadata: Dados adicionais (prestador, tomador, serviço, etc)
     
     Returns:
         Tupla (pdf_bytes, erro)
     """
     cert_path, key_path = cert_files
+    metadata = metadata or {}
     
-    # URL do serviço de geração de DANFSE (ajuste conforme necessário)
-    # Este é um exemplo - você deve usar a URL real do seu serviço
+    # URL do serviço de geração de DANFSE
+    # IMPORTANTE: Ajuste esta URL para o serviço real que você está usando
+    # Opções comuns:
+    # - Serviço próprio de conversão XML -> PDF
+    # - API da prefeitura municipal
+    # - Biblioteca Python (weasyprint, reportlab, etc)
+    
+    # Por enquanto, vamos usar uma abordagem simples com biblioteca Python
+    # Se você tem um serviço externo, descomente e ajuste a seção abaixo
+    
+    """
+    # OPÇÃO 1: Usar serviço externo
     danfse_url = "https://seu-servico-danfse.com/api/gerar-pdf"
     
     _log_step("danfse:pdf:request", xml_size=len(xml_content))
     
     try:
-        # Fazer requisição com certificado
         resp = requests.post(
             danfse_url,
-            data={"xml": xml_content},
+            json={"xml": xml_content, **metadata},
             headers={
-                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Type": "application/json",
                 "Accept": "application/pdf",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             },
@@ -501,8 +512,6 @@ def gerar_danfse_pdf(xml_content: str, cert_files: Tuple[str, str]) -> Tuple[Opt
     except Exception as e:
         return None, f"Erro ao chamar serviço DANFSE: {e}"
     
-    _log_step("danfse:pdf:response", status=resp.status_code, ctype=_ct(resp))
-    
     if not resp.ok:
         try:
             error_data = resp.json()
@@ -510,14 +519,45 @@ def gerar_danfse_pdf(xml_content: str, cert_files: Tuple[str, str]) -> Tuple[Opt
         except:
             return None, f"Erro no serviço DANFSE (HTTP {resp.status_code}): {_preview_text(resp, 500)}"
     
-    # Verificar se retornou PDF
     if "application/pdf" not in _ct(resp):
         return None, f"Resposta não é PDF: {_ct(resp)}"
     
     pdf_bytes = resp.content
-    _log_step("danfse:pdf:success", size=len(pdf_bytes))
+    """
     
-    return pdf_bytes, None
+    # OPÇÃO 2: Gerar PDF localmente (implementação básica)
+    # Esta é uma implementação simplificada - você deve usar uma biblioteca adequada
+    # como weasyprint, reportlab ou similar
+    
+    try:
+        # Parse do XML para extrair dados
+        root = ET.fromstring(xml_content)
+        
+        # Extrair informações básicas (ajuste conforme estrutura do seu XML)
+        # Namespace comum para NFS-e
+        ns = {'nfse': 'http://www.abrasf.org.br/nfse.xsd'}
+        
+        # Tentar extrair dados (estrutura varia por município)
+        nfse_info = {
+            'numero': 'N/A',
+            'data_emissao': 'N/A',
+            'prestador': metadata.get('prestador', {}),
+            'tomador': metadata.get('tomador', {}),
+            'servico': metadata.get('servico', {})
+        }
+        
+        # TODO: Implementar geração real do PDF
+        # Por enquanto, retorna erro informativo
+        return None, (
+            "Geração de DANFSE PDF não implementada. "
+            "Configure um serviço de geração de PDF ou implemente a lógica de conversão XML->PDF. "
+            "Opções: weasyprint, reportlab, ou use um serviço externo da prefeitura."
+        )
+        
+    except ET.ParseError as e:
+        return None, f"Erro ao parsear XML: {e}"
+    except Exception as e:
+        return None, f"Erro ao processar DANFSE: {e}"
 
 # ==========================================================
 # ===================== HTCHAT (GraphQL) ===================
@@ -831,18 +871,92 @@ def sicoob_emitir():
 @app.post("/danfse/pdf")
 def danfse_pdf():
     """
-    Gera PDF do DANFSE a partir do XML.
-    Usa certificado DANFSE isolado (não mistura com Sicoob).
+    Gera PDF do DANFSE a partir da chave de acesso.
+    Busca o XML no Supabase e gera o PDF usando certificado DANFSE isolado.
+    
+    Payload esperado:
+    {
+      "user": "email@exemplo.com",
+      "chave": "chave_acesso_50_digitos",
+      "cnpj_cpf": "documento_empresa",
+      "prestador": {...},  // opcional
+      "tomador": {...},    // opcional
+      "servico": {...}     // opcional
+    }
     """
     dados = request.get_json(silent=True) or {}
     user = dados.get("user")
-    xml_content = dados.get("xml")
+    chave = dados.get("chave")
+    cnpj_cpf = dados.get("cnpj_cpf")
+    
+    _log_step("danfse:request", user=user, chave=chave[:20] if chave else None, cnpj_cpf=cnpj_cpf)
     
     if not user:
         return jsonify({"ok": False, "erro": "Campo 'user' é obrigatório"}), 400
     
-    if not xml_content:
-        return jsonify({"ok": False, "erro": "Campo 'xml' é obrigatório"}), 400
+    if not chave:
+        return jsonify({"ok": False, "erro": "Campo 'chave' é obrigatório"}), 400
+    
+    # Buscar XML no Supabase Storage
+    try:
+        # Construir o caminho do arquivo no storage
+        # Formato: user/empresa/tipo/movimento/ano-mes/chave.xml
+        # Como não temos todos os dados, vamos buscar pela chave
+        
+        # Primeiro, vamos buscar o XML diretamente do bucket
+        params = {
+            "select": "name,id,metadata",
+            "search": f'"{chave}"'
+        }
+        
+        _log_step("danfse:buscar_xml", chave=chave[:20])
+        
+        # Tentar buscar na tabela xml_storage (se existir) ou diretamente no storage
+        # Aqui assumimos que você tem alguma tabela que mapeia chave -> path do XML
+        # Ajuste conforme sua estrutura real
+        
+        # Opção 1: Se você armazena o path na tabela
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/xmls",
+            headers=sb_headers(),
+            params={"chave": f"eq.{chave}", "user": f"eq.{user}", "select": "conteudo"},
+            timeout=20
+        )
+        
+        if resp.ok:
+            rows = resp.json()
+            if rows and len(rows) > 0:
+                xml_content = rows[0].get("conteudo")
+                if xml_content:
+                    _log_step("danfse:xml_encontrado", size=len(xml_content))
+                else:
+                    return jsonify({"ok": False, "erro": "XML encontrado mas sem conteúdo"}), 404
+            else:
+                return jsonify({"ok": False, "erro": f"XML não encontrado para chave {chave[:20]}..."}), 404
+        else:
+            # Opção 2: Buscar direto no storage usando a chave como nome do arquivo
+            storage_path = f"{user}/nfs/saida/{chave}.xml"
+            
+            _log_step("danfse:buscar_storage", path=storage_path)
+            
+            resp_storage = requests.get(
+                f"{SUPABASE_URL}/storage/v1/object/public/xmls/{storage_path}",
+                timeout=20
+            )
+            
+            if resp_storage.ok:
+                xml_content = resp_storage.text
+                _log_step("danfse:xml_storage_ok", size=len(xml_content))
+            else:
+                return jsonify({
+                    "ok": False, 
+                    "erro": f"XML não encontrado no storage. Tentado: {storage_path}",
+                    "detalhes": "Verifique se o XML foi salvo corretamente no Supabase"
+                }), 404
+        
+    except Exception as e:
+        _log_step("danfse:erro_buscar_xml", erro=str(e))
+        return jsonify({"ok": False, "erro": f"Erro ao buscar XML: {e}"}), 500
     
     # Criar gerenciador de certificados isolado para DANFSE
     cert_mgr = CertificateManager()
@@ -854,8 +968,8 @@ def danfse_pdf():
             _log_step("danfse:pdf:erro_cert", erro=erro_cert)
             return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
         
-        # Gerar PDF
-        pdf_bytes, erro_pdf = gerar_danfse_pdf(xml_content, cert_files)
+        # Gerar PDF com informações adicionais do payload
+        pdf_bytes, erro_pdf = gerar_danfse_pdf(xml_content, cert_files, metadata=dados)
         
         if erro_pdf:
             _log_step("danfse:pdf:erro", erro=erro_pdf)
@@ -866,7 +980,7 @@ def danfse_pdf():
             io.BytesIO(pdf_bytes), 
             mimetype="application/pdf", 
             as_attachment=False, 
-            download_name="danfse.pdf"
+            download_name=f"danfse_{chave[:20]}.pdf"
         )
     
     finally:
