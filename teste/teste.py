@@ -12,6 +12,7 @@ import mimetypes
 import time
 import binascii
 from typing import Dict, Any, Tuple, Optional, List
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 CORS(app)
@@ -171,39 +172,121 @@ def carregar_certificados_sicoob(user: Optional[str]) -> Tuple[Optional[Tuple[st
     return CERT_CACHE[cache_key]["cert"], cliente_id, conta, None
 
 def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[str]):
+    """
+    Gera token OAuth do Sicoob com headers mais completos para evitar bloqueio WAF
+    """
     cert_path, key_path = cert_files
     client_id = (client_id_from_db or CLIENT_ID_DEFAULT or "").strip()
 
-    data = {"grant_type": "client_credentials", "client_id": client_id, "scope": SICOOB_SCOPE}
+    # Validação básica do client_id
+    if not client_id:
+        return None, "client_id vazio ou inválido"
 
-    _log_step("token:request", client_id=client_id)
+    # Verificar se os arquivos de certificado existem
+    if not os.path.exists(cert_path) or not os.path.exists(key_path):
+        return None, f"Arquivos de certificado não encontrados: cert={os.path.exists(cert_path)}, key={os.path.exists(key_path)}"
+
+    # Dados do formulário (application/x-www-form-urlencoded)
+    form_data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "scope": SICOOB_SCOPE
+    }
+
+    # Headers completos para evitar bloqueio do WAF
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache"
+    }
+
+    _log_step("token:request", 
+             client_id=client_id[:20] + "...", 
+             scope=SICOOB_SCOPE,
+             cert_exists=os.path.exists(cert_path),
+             key_exists=os.path.exists(key_path))
 
     try:
-        resp = requests.post(
-            SICOOB_TOKEN_URL,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            cert=(cert_path, key_path),
-            timeout=25,
+        # Criar sessão com retry
+        session = requests.Session()
+        
+        # Configurar retry strategy
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
         )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        
+        # Fazer a requisição
+        resp = session.post(
+            SICOOB_TOKEN_URL,
+            data=urlencode(form_data),  # Usar urlencode explícito
+            headers=headers,
+            cert=(cert_path, key_path),
+            timeout=30,  # Aumentar timeout
+            verify=True  # Verificar SSL
+        )
+        
+    except requests.exceptions.SSLError as e:
+        return None, f"Erro SSL ao chamar TOKEN (certificado pode estar inválido): {e}"
+    except requests.exceptions.Timeout as e:
+        return None, f"Timeout ao chamar TOKEN (30s): {e}"
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Erro de conexão ao chamar TOKEN: {e}"
     except Exception as e:
-        return None, f"Erro ao chamar TOKEN: {e}"
+        return None, f"Erro inesperado ao chamar TOKEN: {e}"
 
     ctype = _ct(resp)
-    _log_step("token:response", status=resp.status_code, ctype=ctype)
+    _log_step("token:response", 
+             status=resp.status_code, 
+             ctype=ctype,
+             content_length=len(resp.content))
 
-    # se não for JSON, mostra preview (caso típico "Request Rejected")
+    # Verificar se a resposta é HTML (bloqueio WAF)
+    if "text/html" in ctype:
+        preview = _preview_text(resp, 1000)
+        
+        # Verificar se é bloqueio de WAF
+        if "Request Rejected" in preview or "support ID" in preview.lower():
+            return None, (
+                f"BLOQUEIO WAF DETECTADO - HTTP {resp.status_code}\n"
+                f"Possíveis causas:\n"
+                f"1. Certificado digital inválido ou expirado\n"
+                f"2. Client ID incorreto: {client_id[:30]}...\n"
+                f"3. IP do servidor não está na whitelist do Sicoob\n"
+                f"4. Headers da requisição considerados suspeitos\n"
+                f"Resposta: {preview}"
+            )
+        
+        return None, f"Resposta TOKEN inválida (HTML): HTTP {resp.status_code} | Body={preview}"
+
+    # Tentar parsear JSON
     try:
         j = resp.json()
     except Exception:
         return None, f"Resposta TOKEN inválida (não é JSON): HTTP {resp.status_code} | CT={ctype} | Body={_preview_text(resp, 800)}"
 
+    # Verificar se foi bem sucedido
     if not resp.ok:
-        return None, f"Erro Token: {j}"
+        error_desc = j.get("error_description") or j.get("error") or str(j)
+        return None, f"Erro ao obter Token (HTTP {resp.status_code}): {error_desc}"
 
+    # Extrair token
     token = j.get("access_token")
     if not token:
-        return None, f"Token não retornado. Resposta={j}"
+        return None, f"Token não retornado na resposta. Campos disponíveis: {list(j.keys())}"
+    
+    _log_step("token:success", token_length=len(token), expires_in=j.get("expires_in"))
     return token, None
 
 def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int, modalidade: int, cert_files: Tuple[str, str]):
@@ -216,15 +299,26 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
         "gerarPdf": "true"
     }
 
-    _log_step("segunda_via:request", numeroCliente=n_cliente, contrato=n_contrato, nossoNumero=n_nosso, modalidade=modalidade)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "pt-BR,pt;q=0.9"
+    }
+
+    _log_step("segunda_via:request", 
+             numeroCliente=n_cliente, 
+             contrato=n_contrato, 
+             nossoNumero=n_nosso, 
+             modalidade=modalidade)
 
     try:
         resp = requests.get(
             SICOOB_SEGUNDA_VIA_URL,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
             params=params,
             cert=(cert_path, key_path),
-            timeout=25,
+            timeout=30,
         )
     except Exception as e:
         return None, f"Erro ao baixar PDF: {e}"
@@ -336,6 +430,13 @@ def normalize_recipient(recipient: str) -> str:
     if r.isdigit():
         return f"{r}@s.whatsapp.net"
     return r
+
+def decode_b64_to_bytes(b64_str: str) -> bytes:
+    """Decodifica string base64 para bytes"""
+    try:
+        return base64.b64decode(b64_str)
+    except Exception as e:
+        raise ValueError(f"Base64 inválido: {e}")
 
 def graphql_json(url, token, query, variables, verify_ssl=True, timeout=30):
     return requests.post(
@@ -453,7 +554,14 @@ def htchat_get_sended(htchat_url: str, htchat_token: str, msg_internal_id: int, 
 
 @app.get("/")
 def home():
-    return "API (Flask) — Sicoob + HTChat + Supabase."
+    return jsonify({
+        "app": "API Sicoob + HTChat + Supabase",
+        "version": "2.0",
+        "endpoints": {
+            "sicoob": ["/sicoob/pdf", "/sicoob/emitir"],
+            "htchat": ["/htchat/send", "/htchat/status", "/htchat/recipient_exists", "/htchat/get_sended"]
+        }
+    })
 
 @app.post("/sicoob/pdf")
 def sicoob_pdf():
@@ -510,13 +618,20 @@ def sicoob_emitir():
     if erro_tk:
         return jsonify({"ok": False, "etapa": "token", "erro": erro_tk}), 500
 
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
     try:
         resp = requests.post(
             SICOOB_BOLETO_URL,
             json=payload,
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
             cert=cert_files,
-            timeout=25,
+            timeout=30,
         )
     except Exception as e:
         return jsonify({"ok": False, "etapa": "boleto", "erro": f"Erro request: {e}"}), 500
