@@ -13,6 +13,7 @@ import time
 import binascii
 from typing import Dict, Any, Tuple, Optional, List
 from urllib.parse import urlencode
+import xml.etree.ElementTree as ET
 
 app = Flask(__name__)
 CORS(app)
@@ -45,7 +46,63 @@ def _preview_text(resp: requests.Response, n=800) -> str:
 
 def _log_step(step: str, **k):
     # log compacto no Render
-    print(f"[SICOOB] {step} :: " + " | ".join([f"{a}={k[a]}" for a in k]))
+    print(f"[API] {step} :: " + " | ".join([f"{a}={k[a]}" for a in k]))
+
+# ==========================================================
+# ============= GERENCIADOR DE CERTIFICADOS ================
+# ==========================================================
+
+class CertificateManager:
+    """
+    Gerencia certificados temporários com isolamento por contexto.
+    Evita mistura entre certificados Sicoob e DANFSE.
+    """
+    def __init__(self):
+        self.temp_files = []
+    
+    def create_temp_cert(self, pem_bytes: bytes, key_bytes: bytes, context: str = "default") -> Tuple[str, str]:
+        """
+        Cria certificados temporários e registra para limpeza.
+        
+        Args:
+            pem_bytes: Conteúdo do certificado PEM
+            key_bytes: Conteúdo da chave privada
+            context: Contexto do certificado (sicoob, danfse, etc)
+        
+        Returns:
+            Tupla (cert_path, key_path)
+        """
+        try:
+            cert_fd, cert_path = tempfile.mkstemp(suffix=f"_{context}.pem", prefix="cert_")
+            key_fd, key_path = tempfile.mkstemp(suffix=f"_{context}.key", prefix="key_")
+            
+            with os.fdopen(cert_fd, "wb") as f:
+                f.write(pem_bytes)
+            with os.fdopen(key_fd, "wb") as f:
+                f.write(key_bytes)
+            
+            self.temp_files.append(cert_path)
+            self.temp_files.append(key_path)
+            
+            _log_step("cert:created", context=context, cert=cert_path[-30:], key=key_path[-30:])
+            return cert_path, key_path
+        except Exception as e:
+            raise Exception(f"Erro ao criar certificado temporário [{context}]: {e}")
+    
+    def cleanup(self):
+        """Remove todos os certificados temporários criados."""
+        removed = 0
+        for filepath in self.temp_files:
+            try:
+                if os.path.exists(filepath):
+                    os.unlink(filepath)
+                    removed += 1
+            except Exception as e:
+                _log_step("cert:cleanup_error", file=filepath, error=str(e))
+        
+        if removed > 0:
+            _log_step("cert:cleaned", count=removed)
+        self.temp_files.clear()
 
 # ==========================================================
 # ===================== HTCHAT (SUPABASE) ==================
@@ -158,8 +215,8 @@ def carregar_certificados_sicoob(user: Optional[str]) -> Tuple[Optional[Tuple[st
         return None, None, None, f"Erro base64 pem/key: {e}"
 
     try:
-        cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
-        key_fd, key_path = tempfile.mkstemp(suffix=".key")
+        cert_fd, cert_path = tempfile.mkstemp(suffix="_sicoob.pem")
+        key_fd, key_path = tempfile.mkstemp(suffix="_sicoob.key")
         with os.fdopen(cert_fd, "wb") as f:
             f.write(pem_bytes)
         with os.fdopen(key_fd, "wb") as f:
@@ -204,7 +261,7 @@ def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[
         "Cache-Control": "no-cache"
     }
 
-    _log_step("token:request", 
+    _log_step("sicoob:token:request", 
              client_id=client_id[:20] + "...", 
              scope=SICOOB_SCOPE,
              cert_exists=os.path.exists(cert_path),
@@ -247,7 +304,7 @@ def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[
         return None, f"Erro inesperado ao chamar TOKEN: {e}"
 
     ctype = _ct(resp)
-    _log_step("token:response", 
+    _log_step("sicoob:token:response", 
              status=resp.status_code, 
              ctype=ctype,
              content_length=len(resp.content))
@@ -286,7 +343,7 @@ def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[
     if not token:
         return None, f"Token não retornado na resposta. Campos disponíveis: {list(j.keys())}"
     
-    _log_step("token:success", token_length=len(token), expires_in=j.get("expires_in"))
+    _log_step("sicoob:token:success", token_length=len(token), expires_in=j.get("expires_in"))
     return token, None
 
 def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int, modalidade: int, cert_files: Tuple[str, str]):
@@ -306,7 +363,7 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
         "Accept-Language": "pt-BR,pt;q=0.9"
     }
 
-    _log_step("segunda_via:request", 
+    _log_step("sicoob:segunda_via:request", 
              numeroCliente=n_cliente, 
              contrato=n_contrato, 
              nossoNumero=n_nosso, 
@@ -324,7 +381,7 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
         return None, f"Erro ao baixar PDF: {e}"
 
     ctype = _ct(resp)
-    _log_step("segunda_via:response", status=resp.status_code, ctype=ctype)
+    _log_step("sicoob:segunda_via:response", status=resp.status_code, ctype=ctype)
 
     try:
         data = resp.json()
@@ -344,6 +401,122 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
     except Exception:
         return None, "Erro ao decodificar pdfBoleto"
 
+    return pdf_bytes, None
+
+# ==========================================================
+# ===================== DANFSE =============================
+# ==========================================================
+
+def carregar_certificado_danfse(user: str) -> Tuple[Optional[Tuple[str, str]], Optional[str]]:
+    """
+    Busca certificado DANFSE no Supabase (tabela certifica_danfse).
+    Retorna: (cert_files, erro)
+    """
+    params = {
+        "select": "pem,key",
+        "user": f"eq.{user}",
+        "order": "id.desc",
+        "limit": "1"
+    }
+
+    _log_step("danfse:cert:query", user=user)
+
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/certifica_danfse",
+            headers=sb_headers(),
+            params=params,
+            timeout=20,
+        )
+    except Exception as e:
+        return None, f"Erro ao buscar certificado DANFSE: {e}"
+
+    if not resp.ok:
+        return None, f"Erro ao buscar certificado DANFSE. Status={resp.status_code} - {resp.text}"
+
+    try:
+        rows = resp.json()
+    except Exception:
+        return None, f"Resposta inválida do Supabase: {resp.text}"
+
+    if not rows:
+        return None, "Nenhum certificado DANFSE encontrado para este usuário"
+
+    row = rows[0]
+    pem_b64 = row.get("pem")
+    key_b64 = row.get("key")
+
+    if not pem_b64 or not key_b64:
+        return None, "Campos pem/key vazios (certifica_danfse)"
+
+    try:
+        pem_bytes = base64.b64decode(pem_b64)
+        key_bytes = base64.b64decode(key_b64)
+    except Exception as e:
+        return None, f"Erro ao decodificar base64: {e}"
+
+    # Criar gerenciador de certificados isolado
+    cert_mgr = CertificateManager()
+    try:
+        cert_path, key_path = cert_mgr.create_temp_cert(pem_bytes, key_bytes, context="danfse")
+        _log_step("danfse:cert:ok", user=user)
+        return (cert_path, key_path), None
+    except Exception as e:
+        cert_mgr.cleanup()
+        return None, str(e)
+
+def gerar_danfse_pdf(xml_content: str, cert_files: Tuple[str, str]) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Gera DANFSE PDF a partir do XML usando o serviço externo.
+    
+    Args:
+        xml_content: Conteúdo do XML da NFS-e
+        cert_files: Tupla (cert_path, key_path) do certificado DANFSE
+    
+    Returns:
+        Tupla (pdf_bytes, erro)
+    """
+    cert_path, key_path = cert_files
+    
+    # URL do serviço de geração de DANFSE (ajuste conforme necessário)
+    # Este é um exemplo - você deve usar a URL real do seu serviço
+    danfse_url = "https://seu-servico-danfse.com/api/gerar-pdf"
+    
+    _log_step("danfse:pdf:request", xml_size=len(xml_content))
+    
+    try:
+        # Fazer requisição com certificado
+        resp = requests.post(
+            danfse_url,
+            data={"xml": xml_content},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/pdf",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            },
+            cert=(cert_path, key_path),
+            timeout=30,
+            verify=True
+        )
+    except Exception as e:
+        return None, f"Erro ao chamar serviço DANFSE: {e}"
+    
+    _log_step("danfse:pdf:response", status=resp.status_code, ctype=_ct(resp))
+    
+    if not resp.ok:
+        try:
+            error_data = resp.json()
+            return None, f"Erro no serviço DANFSE: {error_data}"
+        except:
+            return None, f"Erro no serviço DANFSE (HTTP {resp.status_code}): {_preview_text(resp, 500)}"
+    
+    # Verificar se retornou PDF
+    if "application/pdf" not in _ct(resp):
+        return None, f"Resposta não é PDF: {_ct(resp)}"
+    
+    pdf_bytes = resp.content
+    _log_step("danfse:pdf:success", size=len(pdf_bytes))
+    
     return pdf_bytes, None
 
 # ==========================================================
@@ -555,16 +728,20 @@ def htchat_get_sended(htchat_url: str, htchat_token: str, msg_internal_id: int, 
 @app.get("/")
 def home():
     return jsonify({
-        "app": "API Sicoob + HTChat + Supabase",
-        "version": "2.0",
+        "app": "API Sicoob + HTChat + DANFSE + Supabase",
+        "version": "3.0",
         "endpoints": {
             "sicoob": ["/sicoob/pdf", "/sicoob/emitir"],
+            "danfse": ["/danfse/pdf"],
             "htchat": ["/htchat/send", "/htchat/status", "/htchat/recipient_exists", "/htchat/get_sended"]
         }
     })
 
+# =================== ROTAS SICOOB ===================
+
 @app.post("/sicoob/pdf")
 def sicoob_pdf():
+    """Gera PDF de boleto Sicoob"""
     dados = request.get_json(silent=True) or {}
     user = dados.get("user")
 
@@ -574,7 +751,7 @@ def sicoob_pdf():
 
     cert_files, cliente_id_oauth, _, erro_cert = carregar_certificados_sicoob(user)
     if erro_cert:
-        _log_step("pdf:erro_cert", erro=erro_cert)
+        _log_step("sicoob:pdf:erro_cert", erro=erro_cert)
         return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
 
     try:
@@ -587,12 +764,12 @@ def sicoob_pdf():
 
     token, erro_tk = gerar_token_sicoob(cert_files, cliente_id_oauth)
     if erro_tk:
-        _log_step("pdf:erro_token", erro=erro_tk)
+        _log_step("sicoob:pdf:erro_token", erro=erro_tk)
         return jsonify({"ok": False, "etapa": "token", "erro": erro_tk}), 500
 
     pdf_bytes, erro_pdf = baixar_pdf_boleto(token, n_contrato, n_nosso, num_cliente_int, modalidade, cert_files)
     if erro_pdf:
-        _log_step("pdf:erro_segunda_via", erro=str(erro_pdf)[:400])
+        _log_step("sicoob:pdf:erro_segunda_via", erro=str(erro_pdf)[:400])
         return jsonify({"ok": False, "etapa": "segunda_via", "erro": erro_pdf}), 500
 
     return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=False, download_name="boleto.pdf")
@@ -600,6 +777,7 @@ def sicoob_pdf():
 
 @app.post("/sicoob/emitir")
 def sicoob_emitir():
+    """Emite boleto Sicoob"""
     payload = request.get_json(silent=True) or {}
     user = payload.get("user")
     payload.pop("user", None)
@@ -647,6 +825,57 @@ def sicoob_emitir():
     r = j.get("resultado", j)
     return jsonify({"ok": True, "resposta": j, "numeroContratoCobranca": r.get("numeroContratoCobranca"), "nossoNumero": r.get("nossoNumero")})
 
+
+# =================== ROTAS DANFSE ===================
+
+@app.post("/danfse/pdf")
+def danfse_pdf():
+    """
+    Gera PDF do DANFSE a partir do XML.
+    Usa certificado DANFSE isolado (não mistura com Sicoob).
+    """
+    dados = request.get_json(silent=True) or {}
+    user = dados.get("user")
+    xml_content = dados.get("xml")
+    
+    if not user:
+        return jsonify({"ok": False, "erro": "Campo 'user' é obrigatório"}), 400
+    
+    if not xml_content:
+        return jsonify({"ok": False, "erro": "Campo 'xml' é obrigatório"}), 400
+    
+    # Criar gerenciador de certificados isolado para DANFSE
+    cert_mgr = CertificateManager()
+    
+    try:
+        # Carregar certificado DANFSE
+        cert_files, erro_cert = carregar_certificado_danfse(user)
+        if erro_cert:
+            _log_step("danfse:pdf:erro_cert", erro=erro_cert)
+            return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
+        
+        # Gerar PDF
+        pdf_bytes, erro_pdf = gerar_danfse_pdf(xml_content, cert_files)
+        
+        if erro_pdf:
+            _log_step("danfse:pdf:erro", erro=erro_pdf)
+            return jsonify({"ok": False, "etapa": "geracao_pdf", "erro": erro_pdf}), 500
+        
+        # Retornar PDF
+        return send_file(
+            io.BytesIO(pdf_bytes), 
+            mimetype="application/pdf", 
+            as_attachment=False, 
+            download_name="danfse.pdf"
+        )
+    
+    finally:
+        # IMPORTANTE: Limpar certificados temporários DANFSE
+        cert_mgr.cleanup()
+        _log_step("danfse:pdf:cleanup", msg="Certificados DANFSE removidos")
+
+
+# =================== ROTAS HTCHAT ===================
 
 @app.post("/htchat/send")
 def htchat_send_batch():
