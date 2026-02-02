@@ -10,6 +10,7 @@ import mimetypes
 import time
 import binascii
 import re
+import random
 from typing import Dict, Any, Tuple, Optional, List
 
 app = Flask(__name__)
@@ -86,6 +87,12 @@ SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inc
 # cache por user (Sicoob)
 CERT_CACHE: Dict[str, Dict[str, Any]] = {}
 
+def _cache_valid_cert_tuple(cert_tuple: Optional[Tuple[str, str]]) -> bool:
+    if not cert_tuple or not isinstance(cert_tuple, tuple) or len(cert_tuple) != 2:
+        return False
+    c, k = cert_tuple
+    return bool(c and k and os.path.exists(c) and os.path.exists(k))
+
 def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[int], Optional[str]]:
     """
     (SICOOB)
@@ -97,7 +104,10 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
 
     if cache_key in CERT_CACHE:
         info = CERT_CACHE[cache_key]
-        return info["cert"], info.get("cliente_id"), info.get("conta"), None
+        if _cache_valid_cert_tuple(info.get("cert")):
+            return info["cert"], info.get("cliente_id"), info.get("conta"), None
+        # cache quebrado (arquivo temp sumiu)
+        CERT_CACHE.pop(cache_key, None)
 
     if not SUPABASE_KEY:
         return None, None, None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
@@ -137,8 +147,8 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
         return None, None, None, "Campos pem/key vazios"
 
     try:
-        pem_bytes = base64.b64decode(pem_b64)
-        key_bytes = base64.b64decode(key_b64)
+        pem_bytes = base64.b64decode(str(pem_b64).strip())
+        key_bytes = base64.b64decode(str(key_b64).strip())
     except Exception as e:
         return None, None, None, f"Erro ao decodificar base64: {e}"
 
@@ -524,7 +534,11 @@ def carregar_certificados_dfe_local(
 
     ck = _cache_key_dfe(user, codi, empresa, cnpj_cpf)
     if ck in DFE_CERT_CACHE:
-        return DFE_CERT_CACHE[ck]["cert"], None
+        cert_tuple = DFE_CERT_CACHE[ck].get("cert")
+        if _cache_valid_cert_tuple(cert_tuple):
+            return cert_tuple, None
+        # cache quebrado (arquivo temp sumiu)
+        DFE_CERT_CACHE.pop(ck, None)
 
     params = {"select": "pem,key,user,codi,empresa", "order": "id.desc", "limit": "1"}
 
@@ -543,7 +557,6 @@ def carregar_certificados_dfe_local(
 
     # OBS: campo "cnpj/cpf" na sua tabela tem barra e pode exigir sintaxe especial no PostgREST.
     # Para evitar erro, deixei esse filtro DESLIGADO por padrão.
-    # Se você quiser filtrar por ele, me diga o nome exato da coluna no Supabase (às vezes vira "cnpj_cpf" via view).
     _ = cnpj_cpf  # reservado
 
     try:
@@ -575,8 +588,8 @@ def carregar_certificados_dfe_local(
         return None, "Campos pem/key vazios na certifica_dfe"
 
     try:
-        pem_bytes = base64.b64decode(pem_b64)
-        key_bytes = base64.b64decode(key_b64)
+        pem_bytes = base64.b64decode(str(pem_b64).strip())
+        key_bytes = base64.b64decode(str(key_b64).strip())
     except Exception as e:
         return None, f"Erro ao decodificar base64 (certifica_dfe): {e}"
 
@@ -607,6 +620,30 @@ def preview_body(resp: requests.Response, limit: int = 1500) -> str:
     except Exception:
         return "<não foi possível ler texto>"
 
+# ==========================================================
+# ============ SESSION + RETRY (MELHORIA API) ==============
+# ==========================================================
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=1.2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = make_session()
+
 def http_get_with_retry(
     url: str,
     cert_tuple: Tuple[str, str],
@@ -615,42 +652,75 @@ def http_get_with_retry(
     backoff_base: float = 1.5,
 ):
     """
-    GET com retry em 502/503/504 + erros de rede.
+    GET com melhorias:
+    - requests.Session (reuso de conexão/TLS)
+    - timeout separado (connect/read)
+    - stream=True (evita truncar/estourar memória)
+    - jitter no backoff (reduz colisão em instabilidade)
     Retorna Response (última) ou levanta exceção se nunca obteve resposta.
     """
-    last_exc = None
-    last_resp = None
-
     headers = {
         "Accept": "application/pdf",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DANFSeDownloader/1.0",
     }
 
-    for i in range(1, tries + 1):
+    # timeout: connect menor, read maior
+    connect_timeout = 10
+    read_timeout = max(10, int(timeout))
+
+    last_exc = None
+    last_resp = None
+
+    for i in range(1, max(1, tries) + 1):
         try:
-            resp = requests.get(
+            t0 = time.time()
+            resp = SESSION.get(
                 url,
                 cert=cert_tuple,
-                timeout=timeout,
+                timeout=(connect_timeout, read_timeout),
                 allow_redirects=True,
                 headers=headers,
+                stream=True,
             )
-            last_resp = resp
+            dt = round((time.time() - t0) * 1000)
 
-            if resp.status_code in (502, 503, 504):
-                wait = backoff_base * i
+            last_resp = resp
+            ct = resp.headers.get("Content-Type")
+            cl = resp.headers.get("Content-Length")
+
+            print("DANFSE upstream:", {"url": url, "status": resp.status_code, "ms": dt, "ct": ct, "len": cl})
+
+            # Se instável, tenta novamente
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = backoff_base * i * (1 + random.random() * 0.30)
                 time.sleep(wait)
                 continue
 
             return resp
+
         except requests.RequestException as e:
             last_exc = e
-            wait = backoff_base * i
+            wait = backoff_base * i * (1 + random.random() * 0.30)
             time.sleep(wait)
 
     if last_resp is not None:
         return last_resp
     raise last_exc if last_exc else RuntimeError("Falha desconhecida em GET (sem resposta).")
+
+def read_stream_bytes(resp: requests.Response, max_size_bytes: int = 15 * 1024 * 1024) -> bytes:
+    """
+    Lê resp.content via stream com limite de tamanho.
+    """
+    chunks: List[bytes] = []
+    size = 0
+    for chunk in resp.iter_content(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        size += len(chunk)
+        if size > max_size_bytes:
+            raise ValueError("Resposta grande demais (limite de segurança excedido).")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ==========================================================
@@ -929,7 +999,7 @@ def danfse_pdf():
       "env": "producao",                  // producao | restrita (default producao)
       "base_url": "https://adn.nfse.gov.br",   // opcional (override)
       "path_pdf": "/danfse/{chave}",           // opcional (override)
-      "timeout": 60,
+      "timeout": 120,                          // read timeout (segundos)
       "tries": 5,
       "backoff": 1.5
     }
@@ -960,9 +1030,9 @@ def danfse_pdf():
         base_url = "https://adn.producaorestrita.nfse.gov.br" if env == "restrita" else "https://adn.nfse.gov.br"
 
     try:
-        timeout = int(body.get("timeout", 60))
+        timeout = int(body.get("timeout", 120))
     except Exception:
-        timeout = 60
+        timeout = 120
     try:
         tries = int(body.get("tries", 5))
     except Exception:
@@ -987,6 +1057,7 @@ def danfse_pdf():
 
     ctype = (resp.headers.get("Content-Type") or "").lower()
 
+    # Se o upstream falhou, devolve preview
     if resp.status_code >= 400:
         return jsonify({
             "ok": False,
@@ -997,21 +1068,41 @@ def danfse_pdf():
             "url": url
         }), 500
 
-    is_pdf = ("pdf" in ctype) or (resp.content[:4] == b"%PDF")
+    # Lê o PDF via stream (mais robusto no Render)
+    try:
+        content = read_stream_bytes(resp, max_size_bytes=15 * 1024 * 1024)
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "etapa": "download",
+            "erro": f"Falha ao ler PDF via stream: {e}",
+            "http_status": resp.status_code,
+            "content_type": resp.headers.get("Content-Type"),
+            "url": url
+        }), 500
+
+    is_pdf = ("pdf" in ctype) or (content[:4] == b"%PDF")
     if not is_pdf:
+        # tenta pegar um preview “safe” (não binário)
+        body_prev = ""
+        try:
+            body_prev = (content[:1600]).decode("utf-8", errors="replace")
+        except Exception:
+            body_prev = "<binário>"
+
         return jsonify({
             "ok": False,
             "etapa": "conteudo",
             "erro": "Resposta não parece PDF (ajuste path_pdf conforme Swagger)",
             "http_status": resp.status_code,
             "content_type": resp.headers.get("Content-Type"),
-            "body_preview": preview_body(resp, 1600),
+            "body_preview": body_prev,
             "url": url
         }), 500
 
     # retorna o PDF direto para o HTML (inline)
     return send_file(
-        io.BytesIO(resp.content),
+        io.BytesIO(content),
         mimetype="application/pdf",
         as_attachment=False,
         download_name=f"DANFSE_{chave}.pdf"
