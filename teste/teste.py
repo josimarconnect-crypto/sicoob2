@@ -1021,4 +1021,4 @@ def danfse_pdf():
 # ==========================================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True) da uma verificada pra mim se mudou a rota algo do tipo veja na internet se nao tiver nada deixa assim mesmo só me fala 
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
