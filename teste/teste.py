@@ -21,7 +21,7 @@ CORS(app)
 # ==========================================================
 
 SUPABASE_URL = "https://hysrxadnigzqadnlkynq.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c3J4YWRuaWd6cWFkbmxreW5xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDM3MTQwODAsImV4cCI6MjA1OTI5MDA4MH0.RLcu44IvY4X8PLK5BOa_FL5WQ0vJA3p0t80YsGQjTrA"  # ✅ recomendo SERVICE_ROLE no backend
 
 def sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     h = {
@@ -32,6 +32,8 @@ def sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     if extra:
         h.update(extra)
     return h
+
+# -------------------- HTCHAT: insert / update --------------------
 
 def sb_insert_htchat(row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
@@ -84,16 +86,8 @@ SICOOB_SEGUNDA_VIA_URL = f"{SICOOB_BASE_URL}/boletos/segunda-via"
 CLIENT_ID_DEFAULT = "ca417614-7d6f-4f89-ba39-f18ea496431e"
 SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inclusao"
 
-# cache por user (Sicoob) — com TTL para evitar “colar” certificado antigo
+# cache simples por user (Sicoob)
 CERT_CACHE: Dict[str, Dict[str, Any]] = {}
-CERT_CACHE_TTL_SECONDS = 10 * 60  # 10 min
-
-def _norm_user(u: Optional[str]) -> str:
-    return (u or "").strip().lower()
-
-def _cache_valid(entry: Dict[str, Any]) -> bool:
-    ts = entry.get("_ts", 0)
-    return (time.time() - ts) < CERT_CACHE_TTL_SECONDS
 
 def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[int], Optional[str]]:
     """
@@ -102,20 +96,18 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
     Retorna: (cert_files, cliente_id_oauth, conta, erro)
     """
     global CERT_CACHE
+    cache_key = (user or "").strip().lower() or "_default"
 
-    user_n = _norm_user(user)
-    if not user_n:
-        # ✅ NÃO deixa cair em "_default" para não misturar certificados
-        return None, None, None, "Campo 'user' é obrigatório (Sicoob) para evitar mistura de certificados."
-
-    if user_n in CERT_CACHE and _cache_valid(CERT_CACHE[user_n]):
-        info = CERT_CACHE[user_n]
+    if cache_key in CERT_CACHE:
+        info = CERT_CACHE[cache_key]
         return info["cert"], info.get("cliente_id"), info.get("conta"), None
 
     if not SUPABASE_KEY:
         return None, None, None, "SUPABASE_KEY não configurada"
 
-    params = {"select": "pem,key,cliente_id,conta", "order": "id.desc", "limit": "1", "user": f"eq.{user_n}"}
+    params = {"select": "pem,key,cliente_id,conta", "order": "id.desc", "limit": "1"}
+    if user:
+        params["user"] = f"eq.{user}"
 
     try:
         resp = requests.get(
@@ -136,7 +128,7 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
         return None, None, None, f"Resposta inválida do Supabase: {resp.text}"
 
     if not rows:
-        return None, None, None, "Nenhum certificado encontrado para este usuário (certifica_sicoob)"
+        return None, None, None, "Nenhum certificado encontrado para este usuário"
 
     row = rows[0]
     pem_b64 = row.get("pem")
@@ -145,7 +137,7 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
     conta = row.get("conta")
 
     if not pem_b64 or not key_b64:
-        return None, None, None, "Campos pem/key vazios (certifica_sicoob)"
+        return None, None, None, "Campos pem/key vazios"
 
     try:
         pem_bytes = base64.b64decode(pem_b64)
@@ -163,17 +155,12 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
     except Exception as e:
         return None, None, None, f"Erro ao criar arquivos temporários: {e}"
 
-    CERT_CACHE[user_n] = {
-        "cert": (cert_path, key_path),
-        "cliente_id": cliente_id,
-        "conta": conta,
-        "_ts": time.time(),
-    }
-    return CERT_CACHE[user_n]["cert"], cliente_id, conta, None
+    CERT_CACHE[cache_key] = {"cert": (cert_path, key_path), "cliente_id": cliente_id, "conta": conta}
+    return CERT_CACHE[cache_key]["cert"], cliente_id, conta, None
 
 def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[str]):
     cert_path, key_path = cert_files
-    client_id = (client_id_from_db or CLIENT_ID_DEFAULT or "").strip()
+    client_id = client_id_from_db or CLIENT_ID_DEFAULT
 
     data = {"grant_type": "client_credentials", "client_id": client_id, "scope": SICOOB_SCOPE}
 
@@ -334,7 +321,7 @@ query recipient_exists($recipient: String!, $api_id: String) {
 
 
 # ==========================================================
-# ===================== UTILS BASE64 =======================
+# ===================== HTCHAT HELPERS =====================
 # ==========================================================
 
 def decode_b64_to_bytes(b64_str: str) -> bytes:
@@ -353,11 +340,6 @@ def decode_b64_to_bytes(b64_str: str) -> bytes:
             return base64.b64decode(b64_str)
         except Exception as e:
             raise ValueError(f"Falha ao decodificar base64: {e}")
-
-
-# ==========================================================
-# ===================== HTCHAT HELPERS =====================
-# ==========================================================
 
 def safe_json(resp: requests.Response):
     try:
@@ -439,7 +421,7 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
     has_file = bool(item.get("file_b64")) or bool(item.get("file_path"))
     tipo = (item.get("tipo") or "text").strip()
 
-    # ✅ FIX: HTChat com arquivo exige tipo "text"
+    # ✅ compat: envio com arquivo tende a exigir "text"
     if has_file:
         tipo = "text"
 
@@ -453,7 +435,6 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
             return None, f"file_b64 inválido: {e}"
 
         vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
-
         operations = json.dumps({"query": SEND_FILE, "variables": {**vars2, "file": None}}, ensure_ascii=False)
         file_map = json.dumps({"0": ["variables.file"]}, ensure_ascii=False)
 
@@ -497,154 +478,12 @@ def htchat_get_sended(htchat_url: str, htchat_token: str, msg_internal_id: int, 
 
 
 # ==========================================================
-# ============ DANFSe (OFICIAL) - CERTIFICA_DFE ============
-# ==========================================================
-
-DFE_CERT_CACHE: Dict[str, Dict[str, Any]] = {}
-DFE_CACHE_TTL_SECONDS = 10 * 60
-
-def _cache_key_dfe(user: str, codi: Optional[Any], empresa: Optional[str], cnpj_cpf: Optional[str]) -> str:
-    return f"{(user or '').strip().lower()}|codi={codi}|emp={(empresa or '').strip().lower()}|doc={(cnpj_cpf or '').strip()}"
-
-def _dfe_cache_valid(entry: Dict[str, Any]) -> bool:
-    ts = entry.get("_ts", 0)
-    return (time.time() - ts) < DFE_CACHE_TTL_SECONDS
-
-def carregar_certificados_dfe_local(
-    user: str,
-    codi: Optional[Any] = None,
-    empresa: Optional[str] = None,
-    cnpj_cpf: Optional[str] = None
-) -> Tuple[Optional[Tuple[str, str]], Optional[str]]:
-    global DFE_CERT_CACHE
-
-    user_n = _norm_user(user)
-    if not user_n:
-        return None, "user é obrigatório para buscar certificado (certifica_dfe)"
-
-    ck = _cache_key_dfe(user_n, codi, empresa, cnpj_cpf)
-    if ck in DFE_CERT_CACHE and _dfe_cache_valid(DFE_CERT_CACHE[ck]):
-        return DFE_CERT_CACHE[ck]["cert"], None
-
-    params = {"select": "pem,key,user,codi,empresa", "order": "id.desc", "limit": "1"}
-    params["user"] = f"eq.{user_n}"
-
-    if codi not in (None, "", 0, "0"):
-        try:
-            params["codi"] = f"eq.{int(str(codi))}"
-        except Exception:
-            return None, f"codi inválido: {codi}"
-
-    if (not params.get("codi")) and empresa:
-        params["empresa"] = f"eq.{empresa}"
-
-    try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/certifica_dfe",
-            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-            params=params,
-            timeout=20,
-        )
-    except Exception as e:
-        return None, f"Erro ao chamar Supabase (certifica_dfe): {e}"
-
-    if not resp.ok:
-        return None, f"Erro Supabase certifica_dfe. Status={resp.status_code}, texto={resp.text}"
-
-    try:
-        rows: List[Dict[str, Any]] = resp.json()
-    except ValueError:
-        return None, f"Resposta inválida do Supabase (certifica_dfe): {resp.text}"
-
-    if not rows:
-        return None, "Nenhum certificado encontrado na certifica_dfe para este filtro"
-
-    row = rows[0]
-    pem_b64 = row.get("pem")
-    key_b64 = row.get("key")
-
-    if not pem_b64 or not key_b64:
-        return None, "Campos pem/key vazios na certifica_dfe"
-
-    try:
-        pem_bytes = base64.b64decode(pem_b64)
-        key_bytes = base64.b64decode(key_b64)
-    except Exception as e:
-        return None, f"Erro ao decodificar base64 (certifica_dfe): {e}"
-
-    try:
-        cert_fd, cert_path = tempfile.mkstemp(suffix=".pem")
-        key_fd, key_path = tempfile.mkstemp(suffix=".key")
-        with os.fdopen(cert_fd, "wb") as f:
-            f.write(pem_bytes)
-        with os.fdopen(key_fd, "wb") as f:
-            f.write(key_bytes)
-    except Exception as e:
-        return None, f"Erro ao criar arquivos temporários (DFE): {e}"
-
-    DFE_CERT_CACHE[ck] = {"cert": (cert_path, key_path), "_ts": time.time()}
-    return DFE_CERT_CACHE[ck]["cert"], None
-
-def build_url(base: str, path_template: str, chave: str) -> str:
-    base = (base or "").strip().rstrip("/")
-    path_template = (path_template or "").strip()
-    if not path_template.startswith("/"):
-        path_template = "/" + path_template
-    return base + path_template.replace("{chave}", chave)
-
-def preview_body(resp: requests.Response, limit: int = 1500) -> str:
-    try:
-        txt = resp.text or ""
-        return txt[:limit]
-    except Exception:
-        return "<não foi possível ler texto>"
-
-def http_get_with_retry(
-    url: str,
-    cert_tuple: Tuple[str, str],
-    timeout: int = 60,
-    tries: int = 5,
-    backoff_base: float = 1.5,
-):
-    last_exc = None
-    last_resp = None
-    headers = {
-        "Accept": "application/pdf",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DANFSeDownloader/1.0",
-    }
-
-    for i in range(1, tries + 1):
-        try:
-            resp = requests.get(
-                url,
-                cert=cert_tuple,
-                timeout=timeout,
-                allow_redirects=True,
-                headers=headers,
-            )
-            last_resp = resp
-
-            if resp.status_code in (502, 503, 504):
-                time.sleep(backoff_base * i)
-                continue
-
-            return resp
-        except requests.RequestException as e:
-            last_exc = e
-            time.sleep(backoff_base * i)
-
-    if last_resp is not None:
-        return last_resp
-    raise last_exc if last_exc else RuntimeError("Falha desconhecida em GET (sem resposta).")
-
-
-# ==========================================================
 # ===================== ROTAS ==============================
 # ==========================================================
 
 @app.get("/")
 def home():
-    return "API Unificada (Flask) — Sicoob + HTChat/WhatsApp + DANFSe (mTLS) + Supabase."
+    return "API (Flask) — Sicoob + HTChat/WhatsApp + Supabase."
 
 # -------------------- SICOOB --------------------
 
@@ -656,7 +495,7 @@ def api_emitir():
 
     cert_files, cliente_id_oauth, conta_corrente, erro_cert = carregar_certificados_local(user)
     if erro_cert:
-        return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 400
+        return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
 
     if conta_corrente is not None:
         try:
@@ -692,7 +531,7 @@ def api_pdf():
 
     cert_files, cliente_id_oauth, _, erro_cert = carregar_certificados_local(user)
     if erro_cert:
-        return jsonify({"erro": erro_cert}), 400
+        return jsonify({"erro": erro_cert}), 500
 
     try:
         num_cliente_int = int(str(numero_cliente))
@@ -708,7 +547,6 @@ def api_pdf():
 
     pdf_bytes, erro_pdf = baixar_pdf_boleto(token, n_contrato, n_nosso, num_cliente_int, modalidade, cert_files)
     if erro_pdf:
-        print("❌ ERRO /sicoob/pdf:", erro_pdf)
         return jsonify({"erro": erro_pdf}), 500
 
     return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf", as_attachment=False, download_name="boleto.pdf")
@@ -761,12 +599,8 @@ def htchat_send_batch():
                 "status": f"erro: {err}",
                 "user": user,
             }
-            _, sb_err = sb_insert_htchat(row_err)
-            if sb_err:
-                print("⚠ Falha ao inserir erro htchat:", sb_err)
-
+            sb_insert_htchat(row_err)
             results.append({"i": idx, "recipient": recipient_norm, "ok": False, "erro": err})
-
         else:
             msg_internal_id = node.get("id")
             ack = node.get("ack")
@@ -779,10 +613,7 @@ def htchat_send_batch():
                 "status": f"{ack}" if ack is not None else "sent",
                 "user": user,
             }
-            _, sb_err = sb_insert_htchat(row_ok)
-            if sb_err:
-                print("⚠ Falha ao inserir htchat:", sb_err)
-
+            sb_insert_htchat(row_ok)
             results.append({
                 "i": idx,
                 "recipient": recipient_norm,
@@ -834,10 +665,7 @@ def htchat_update_status():
     ack = node.get("ack")
     status_str = f"{ack}" if ack is not None else "null"
 
-    up_err = sb_update_htchat_status_by_idms(str(msg_internal_id), status_str)
-    if up_err:
-        print("⚠ Falha ao atualizar status no Supabase:", up_err)
-
+    sb_update_htchat_status_by_idms(str(msg_internal_id), status_str)
     return jsonify({"ok": True, "id": msg_internal_id, "ack": ack, "updated_status": status_str, "node": node})
 
 
@@ -879,95 +707,6 @@ def htchat_get_sended_route():
     if err:
         return jsonify({"ok": False, "erro": err}), 500
     return jsonify({"ok": True, "node": node})
-
-
-# ==========================================================
-# ===================== NOVA ROTA DANFSe ===================
-# ==========================================================
-
-@app.post("/danfse/pdf")
-def danfse_pdf():
-    body = request.get_json(silent=True) or {}
-
-    user = (body.get("user") or "").strip()
-    if not user:
-        return jsonify({"ok": False, "erro": "Campo 'user' é obrigatório"}), 400
-
-    chave = (body.get("chave") or "").strip()
-    if not chave or len(chave) < 20:
-        return jsonify({"ok": False, "erro": "Campo 'chave' inválido/curto"}), 400
-
-    codi = body.get("codi")
-    empresa = body.get("empresa")
-    cnpj_cpf = body.get("cnpj_cpf")
-
-    cert_files, errc = carregar_certificados_dfe_local(user=user, codi=codi, empresa=empresa, cnpj_cpf=cnpj_cpf)
-    if errc:
-        return jsonify({"ok": False, "etapa": "certifica_dfe", "erro": errc}), 500
-
-    env = (body.get("env") or "producao").strip().lower()
-    base_url = (body.get("base_url") or "").strip()
-    path_pdf = (body.get("path_pdf") or "/danfse/{chave}").strip()
-
-    if not base_url:
-        base_url = "https://adn.producaorestrita.nfse.gov.br" if env == "restrita" else "https://adn.nfse.gov.br"
-
-    try:
-        timeout = int(body.get("timeout", 60))
-    except Exception:
-        timeout = 60
-    try:
-        tries = int(body.get("tries", 5))
-    except Exception:
-        tries = 5
-    try:
-        backoff = float(body.get("backoff", 1.5))
-    except Exception:
-        backoff = 1.5
-
-    url = build_url(base_url, path_pdf, chave)
-
-    try:
-        resp = http_get_with_retry(
-            url=url,
-            cert_tuple=cert_files,
-            timeout=max(10, timeout),
-            tries=max(1, tries),
-            backoff_base=max(0.1, backoff),
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "etapa": "request", "erro": f"Falha ao chamar serviço DANFSe: {e}"}), 500
-
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-
-    if resp.status_code >= 400:
-        return jsonify({
-            "ok": False,
-            "etapa": "http",
-            "http_status": resp.status_code,
-            "content_type": resp.headers.get("Content-Type"),
-            "body_preview": preview_body(resp, 1600),
-            "url": url
-        }), 500
-
-    is_pdf = ("pdf" in ctype) or (resp.content[:4] == b"%PDF")
-    if not is_pdf:
-        return jsonify({
-            "ok": False,
-            "etapa": "conteudo",
-            "erro": "Resposta não parece PDF (ajuste path_pdf conforme Swagger)",
-            "http_status": resp.status_code,
-            "content_type": resp.headers.get("Content-Type"),
-            "body_preview": preview_body(resp, 1600),
-            "url": url
-        }), 500
-
-    return send_file(
-        io.BytesIO(resp.content),
-        mimetype="application/pdf",
-        as_attachment=False,
-        download_name=f"DANFSE_{chave}.pdf"
-    )
 
 
 # ==========================================================
