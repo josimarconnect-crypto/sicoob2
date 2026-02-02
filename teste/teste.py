@@ -106,7 +106,6 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
         info = CERT_CACHE[cache_key]
         if _cache_valid_cert_tuple(info.get("cert")):
             return info["cert"], info.get("cliente_id"), info.get("conta"), None
-        # cache quebrado (arquivo temp sumiu)
         CERT_CACHE.pop(cache_key, None)
 
     if not SUPABASE_KEY:
@@ -327,29 +326,19 @@ query recipient_exists($recipient: String!, $api_id: String) {
 }
 """.strip()
 
-
 # ==========================================================
 # ===================== UTILS BASE64 =======================
 # ==========================================================
 
 def decode_b64_to_bytes(b64_str: str) -> bytes:
-    """
-    Decodifica string base64 para bytes de forma robusta.
-    Remove prefixos 'data:*;base64,' e corrige padding.
-    """
     if not b64_str:
         return b""
-
     if "base64," in b64_str:
         b64_str = b64_str.split("base64,", 1)[1]
-
-    b64_str = b64_str.strip()
-    b64_str = b64_str.replace("\n", "").replace("\r", "").replace(" ", "")
-
+    b64_str = b64_str.strip().replace("\n", "").replace("\r", "").replace(" ", "")
     missing = (-len(b64_str)) % 4
     if missing:
         b64_str += "=" * missing
-
     try:
         return base64.b64decode(b64_str, validate=True)
     except binascii.Error:
@@ -357,7 +346,6 @@ def decode_b64_to_bytes(b64_str: str) -> bytes:
             return base64.b64decode(b64_str)
         except Exception as e:
             raise ValueError(f"Falha ao decodificar base64: {e}")
-
 
 # ==========================================================
 # ===================== HTCHAT HELPERS =====================
@@ -442,26 +430,18 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
 
     has_file = bool(item.get("file_b64")) or bool(item.get("file_path"))
     tipo = (item.get("tipo") or "text").strip()
-
-    # ✅ FIX: HTChat com arquivo exige tipo "text"
     if has_file:
         tipo = "text"
 
-    # ----------- arquivo via base64 (bytes) -----------
     if item.get("file_b64"):
         file_name = item.get("file_name") or "arquivo.bin"
         file_mime = item.get("file_mime") or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
-
         try:
             file_bytes = decode_b64_to_bytes(item["file_b64"])
         except Exception as e:
             return None, f"file_b64 inválido: {e}"
 
-        if file_mime == "application/pdf" and file_bytes and not file_bytes.startswith(b"%PDF"):
-            print(f"⚠️ Aviso: Arquivo {file_name} não parece PDF válido (ausência de %PDF).")
-
         vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
-
         operations = json.dumps({"query": SEND_FILE, "variables": {**vars2, "file": None}}, ensure_ascii=False)
         file_map = json.dumps({"0": ["variables.file"]}, ensure_ascii=False)
 
@@ -481,7 +461,6 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
             node["_upload_mode"] = "bytes ops/map"
         return node, err
 
-    # ----------- texto -----------
     if not str(message).strip():
         return None, "message vazio (para texto é obrigatório)"
 
@@ -509,7 +488,6 @@ def htchat_get_sended(htchat_url: str, htchat_token: str, msg_internal_id: int, 
 # ============ DANFSe (OFICIAL) - CERTIFICA_DFE ============
 # ==========================================================
 
-# cache por user/codi (DFE)
 DFE_CERT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def _cache_key_dfe(user: str, codi: Optional[Any], empresa: Optional[str], cnpj_cpf: Optional[str]) -> str:
@@ -524,8 +502,6 @@ def carregar_certificados_dfe_local(
     """
     (DFE / NFS-e / DANFSe)
     Busca o último certificado na certifica_dfe e cria arquivos temporários PEM/KEY.
-    Campos esperados na tabela: pem, key, user, codi, empresa, ...
-    Retorna: ((cert_path, key_path), erro)
     """
     global DFE_CERT_CACHE
 
@@ -537,12 +513,9 @@ def carregar_certificados_dfe_local(
         cert_tuple = DFE_CERT_CACHE[ck].get("cert")
         if _cache_valid_cert_tuple(cert_tuple):
             return cert_tuple, None
-        # cache quebrado (arquivo temp sumiu)
         DFE_CERT_CACHE.pop(ck, None)
 
-    params = {"select": "pem,key,user,codi,empresa", "order": "id.desc", "limit": "1"}
-
-    # filtros
+    params = {"select": "pem,key,user,codi,empresa,id", "order": "id.desc", "limit": "1"}
     params["user"] = f"eq.{user}"
 
     if codi not in (None, "", 0, "0"):
@@ -551,12 +524,9 @@ def carregar_certificados_dfe_local(
         except Exception:
             return None, f"codi inválido: {codi}"
 
-    # se não vier codi, pode filtrar por empresa (opcional)
     if (not params.get("codi")) and empresa:
         params["empresa"] = f"eq.{empresa}"
 
-    # OBS: campo "cnpj/cpf" na sua tabela tem barra e pode exigir sintaxe especial no PostgREST.
-    # Para evitar erro, deixei esse filtro DESLIGADO por padrão.
     _ = cnpj_cpf  # reservado
 
     try:
@@ -583,6 +553,12 @@ def carregar_certificados_dfe_local(
     row = rows[0]
     pem_b64 = row.get("pem")
     key_b64 = row.get("key")
+
+    # log apenas metadados (para você confirmar que é o registro certo)
+    try:
+        print("DANFSE cert row:", {"id": row.get("id"), "user": row.get("user"), "codi": row.get("codi"), "empresa": row.get("empresa")})
+    except Exception:
+        pass
 
     if not pem_b64 or not key_b64:
         return None, "Campos pem/key vazios na certifica_dfe"
@@ -615,10 +591,19 @@ def build_url(base: str, path_template: str, chave: str) -> str:
 
 def preview_body(resp: requests.Response, limit: int = 1500) -> str:
     try:
-        txt = resp.text or ""
-        return txt[:limit]
+        return (resp.text or "")[:limit]
     except Exception:
         return "<não foi possível ler texto>"
+
+def try_problem_json(resp: requests.Response) -> Optional[Dict[str, Any]]:
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    if "application/problem+json" not in ct:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
 
 # ==========================================================
 # ============ SESSION + RETRY (MELHORIA API) ==============
@@ -651,20 +636,11 @@ def http_get_with_retry(
     tries: int = 5,
     backoff_base: float = 1.5,
 ):
-    """
-    GET com melhorias:
-    - requests.Session (reuso de conexão/TLS)
-    - timeout separado (connect/read)
-    - stream=True (evita truncar/estourar memória)
-    - jitter no backoff (reduz colisão em instabilidade)
-    Retorna Response (última) ou levanta exceção se nunca obteve resposta.
-    """
     headers = {
         "Accept": "application/pdf",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DANFSeDownloader/1.0",
     }
 
-    # timeout: connect menor, read maior
     connect_timeout = 10
     read_timeout = max(10, int(timeout))
 
@@ -683,21 +659,22 @@ def http_get_with_retry(
                 stream=True,
             )
             dt = round((time.time() - t0) * 1000)
-
             last_resp = resp
-            ct = resp.headers.get("Content-Type")
-            cl = resp.headers.get("Content-Length")
 
-            print("DANFSE upstream:", {"url": url, "status": resp.status_code, "ms": dt, "ct": ct, "len": cl})
+            print("DANFSE upstream:", {
+                "url": url,
+                "status": resp.status_code,
+                "ms": dt,
+                "ct": resp.headers.get("Content-Type"),
+                "len": resp.headers.get("Content-Length"),
+            })
 
-            # Se instável, tenta novamente
             if resp.status_code in (429, 500, 502, 503, 504):
                 wait = backoff_base * i * (1 + random.random() * 0.30)
                 time.sleep(wait)
                 continue
 
             return resp
-
         except requests.RequestException as e:
             last_exc = e
             wait = backoff_base * i * (1 + random.random() * 0.30)
@@ -708,9 +685,6 @@ def http_get_with_retry(
     raise last_exc if last_exc else RuntimeError("Falha desconhecida em GET (sem resposta).")
 
 def read_stream_bytes(resp: requests.Response, max_size_bytes: int = 15 * 1024 * 1024) -> bytes:
-    """
-    Lê resp.content via stream com limite de tamanho.
-    """
     chunks: List[bytes] = []
     size = 0
     for chunk in resp.iter_content(chunk_size=64 * 1024):
@@ -803,20 +777,6 @@ def api_pdf():
 
 @app.post("/htchat/send")
 def htchat_send_batch():
-    """
-    Body:
-    {
-      "user": "teste@gmail.com",
-      "delay_seconds": 15,
-      "verify_ssl": true,
-      "htchat_url": "https://.../graphql_api",
-      "htchat_token": "TOKEN",
-      "messages": [
-        {"recipient":"5569...","tipo":"text","message":"oi"},
-        {"recipient":"5569...","tipo":"text","message":"segue","file_name":"a.pdf","file_mime":"application/pdf","file_b64":"..."}
-      ]
-    }
-    """
     body = request.get_json(silent=True) or {}
 
     user = (body.get("user") or "").strip()
@@ -865,7 +825,6 @@ def htchat_send_batch():
                 print("⚠ Falha ao inserir erro htchat:", sb_err)
 
             results.append({"i": idx, "recipient": recipient_norm, "ok": False, "erro": err})
-
         else:
             msg_internal_id = node.get("id")
             ack = node.get("ack")
@@ -954,7 +913,7 @@ def htchat_recipient_exists():
     r = graphql_json(
         htchat_url, htchat_token, QUERY_RECIPIENT_EXISTS,
         {"recipient": recipient, "api_id": api_id},
-        verify_ssl=bool(body.get("verify_ssl", True))
+        verify=bool(body.get("verify_ssl", True))
     )
     return jsonify({"ok": True, "resp": safe_json(r)})
 
@@ -981,54 +940,80 @@ def htchat_get_sended_route():
 
 
 # ==========================================================
-# ===================== NOVA ROTA DANFSe ===================
+# ===================== DANFSe (TRATATIVA) =================
 # ==========================================================
+
+def _norm_str(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+def _norm_env(v: Any) -> str:
+    e = _norm_str(v).lower()
+    if e in ("restrita", "producao", "produção"):
+        return "restrita" if e == "restrita" else "producao"
+    return "producao"
+
+def _norm_int_or_none(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    s = _norm_str(v)
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+def _safe_payload_for_log(body: Dict[str, Any]) -> Dict[str, Any]:
+    # não loga nada sensível; só o que importa pro debug do HTML
+    return {
+        "user": _norm_str(body.get("user")),
+        "codi": body.get("codi"),
+        "empresa": _norm_str(body.get("empresa")),
+        "env": _norm_str(body.get("env")),
+        "base_url": _norm_str(body.get("base_url")),
+        "path_pdf": _norm_str(body.get("path_pdf")),
+        "chave_len": len(_norm_str(body.get("chave"))),
+        "chave_prefix": _norm_str(body.get("chave"))[:10],
+    }
 
 @app.post("/danfse/pdf")
 def danfse_pdf():
     """
-    Baixa DANFSe (PDF oficial) via Ambiente Nacional NFS-e (mTLS) usando PEM/KEY do Supabase (certifica_dfe).
-
-    Body exemplo:
-    {
-      "user": "operador@dominio.com",
-      "codi": 123,                       // recomendado
-      "empresa": "MINHA EMPRESA LTDA",    // opcional (se não passar codi)
-      "cnpj_cpf": "123...",               // opcional (reservado)
-      "chave": "SUA_CHAVE_DE_ACESSO",
-      "env": "producao",                  // producao | restrita (default producao)
-      "base_url": "https://adn.nfse.gov.br",   // opcional (override)
-      "path_pdf": "/danfse/{chave}",           // opcional (override)
-      "timeout": 120,                          // read timeout (segundos)
-      "tries": 5,
-      "backoff": 1.5
-    }
+    TRATATIVA:
+    - Normaliza o que chega do HTML
+    - Loga payload (sem segredos)
+    - Tenta PROD e, se 404, tenta RESTRITA automaticamente
+    - Repasse status upstream (404/403/401 etc.) ao frontend
     """
     body = request.get_json(silent=True) or {}
+    print("DANFSE request body:", _safe_payload_for_log(body))
 
-    user = (body.get("user") or "").strip()
+    user = _norm_str(body.get("user"))
     if not user:
         return jsonify({"ok": False, "erro": "Campo 'user' é obrigatório"}), 400
 
-    chave = (body.get("chave") or "").strip()
+    chave = _norm_str(body.get("chave"))
     if not chave or len(chave) < 20:
         return jsonify({"ok": False, "erro": "Campo 'chave' inválido/curto"}), 400
 
-    codi = body.get("codi")
-    empresa = body.get("empresa")
-    cnpj_cpf = body.get("cnpj_cpf")
+    # normaliza params vindos do HTML
+    codi = _norm_int_or_none(body.get("codi"))
+    empresa = _norm_str(body.get("empresa")) or None
+    cnpj_cpf = _norm_str(body.get("cnpj_cpf")) or None
 
-    cert_files, errc = carregar_certificados_dfe_local(user=user, codi=codi, empresa=empresa, cnpj_cpf=cnpj_cpf)
-    if errc:
-        return jsonify({"ok": False, "etapa": "certifica_dfe", "erro": errc}), 500
+    env = _norm_env(body.get("env"))
+    base_url_in = _norm_str(body.get("base_url"))
+    path_pdf = _norm_str(body.get("path_pdf")) or "/danfse/{chave}"
 
-    env = (body.get("env") or "producao").strip().lower()
-    base_url = (body.get("base_url") or "").strip()
-    path_pdf = (body.get("path_pdf") or "/danfse/{chave}").strip()
+    # defaults do ambiente
+    def _base_for(env_local: str) -> str:
+        if base_url_in:
+            return base_url_in
+        return "https://adn.producaorestrita.nfse.gov.br" if env_local == "restrita" else "https://adn.nfse.gov.br"
 
-    if not base_url:
-        base_url = "https://adn.producaorestrita.nfse.gov.br" if env == "restrita" else "https://adn.nfse.gov.br"
-
+    # timeouts/tries/backoff (do HTML ou defaults)
     try:
         timeout = int(body.get("timeout", 120))
     except Exception:
@@ -1042,71 +1027,108 @@ def danfse_pdf():
     except Exception:
         backoff = 1.5
 
-    url = build_url(base_url, path_pdf, chave)
+    # certificado (você disse que está correto)
+    cert_files, errc = carregar_certificados_dfe_local(user=user, codi=codi, empresa=empresa, cnpj_cpf=cnpj_cpf)
+    if errc:
+        return jsonify({"ok": False, "etapa": "certifica_dfe", "erro": errc}), 500
 
-    try:
-        resp = http_get_with_retry(
-            url=url,
-            cert_tuple=cert_files,
-            timeout=max(10, timeout),
-            tries=max(1, tries),
-            backoff_base=max(0.1, backoff),
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "etapa": "request", "erro": f"Falha ao chamar serviço DANFSe: {e}"}), 500
+    # tenta no ambiente recebido; se der 404, tenta no outro ambiente automaticamente
+    env_try_order = [env, ("restrita" if env == "producao" else "producao")]
 
-    ctype = (resp.headers.get("Content-Type") or "").lower()
+    last_resp = None
+    last_url = None
 
-    # Se o upstream falhou, devolve preview
-    if resp.status_code >= 400:
+    for env_try in env_try_order:
+        base_url = _base_for(env_try)
+        url = build_url(base_url, path_pdf, chave)
+        last_url = url
+
+        try:
+            resp = http_get_with_retry(
+                url=url,
+                cert_tuple=cert_files,
+                timeout=max(10, timeout),
+                tries=max(1, tries),
+                backoff_base=max(0.1, backoff),
+            )
+        except Exception as e:
+            return jsonify({"ok": False, "etapa": "request", "erro": f"Falha ao chamar serviço DANFSe: {e}", "url": url}), 502
+
+        last_resp = resp
+
+        # Se achou PDF, para aqui
+        if resp.status_code < 400:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            try:
+                content = read_stream_bytes(resp, max_size_bytes=15 * 1024 * 1024)
+            except Exception as e:
+                return jsonify({
+                    "ok": False,
+                    "etapa": "download",
+                    "erro": f"Falha ao ler PDF via stream: {e}",
+                    "http_status": resp.status_code,
+                    "content_type": resp.headers.get("Content-Type"),
+                    "url": url,
+                    "env_used": env_try,
+                }), 502
+
+            is_pdf = ("pdf" in ctype) or (content[:4] == b"%PDF")
+            if not is_pdf:
+                body_prev = ""
+                try:
+                    body_prev = content[:1600].decode("utf-8", errors="replace")
+                except Exception:
+                    body_prev = "<binário>"
+                return jsonify({
+                    "ok": False,
+                    "etapa": "conteudo",
+                    "erro": "Resposta não parece PDF (path_pdf errado ou serviço retornou JSON)",
+                    "http_status": resp.status_code,
+                    "content_type": resp.headers.get("Content-Type"),
+                    "body_preview": body_prev,
+                    "url": url,
+                    "env_used": env_try,
+                }), 502
+
+            return send_file(
+                io.BytesIO(content),
+                mimetype="application/pdf",
+                as_attachment=False,
+                download_name=f"DANFSE_{chave}.pdf"
+            )
+
+        # Se der 404 e ainda tem outro ambiente pra tentar, continua
+        if resp.status_code == 404:
+            continue
+
+        # outros erros (401/403/400/500 etc.) -> devolve imediatamente com status real
+        prob = try_problem_json(resp)
         return jsonify({
             "ok": False,
             "etapa": "http",
             "http_status": resp.status_code,
             "content_type": resp.headers.get("Content-Type"),
+            "problem_json": prob,
             "body_preview": preview_body(resp, 1600),
-            "url": url
-        }), 500
+            "url": url,
+            "env_used": env_try,
+        }), resp.status_code
 
-    # Lê o PDF via stream (mais robusto no Render)
-    try:
-        content = read_stream_bytes(resp, max_size_bytes=15 * 1024 * 1024)
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "etapa": "download",
-            "erro": f"Falha ao ler PDF via stream: {e}",
-            "http_status": resp.status_code,
-            "content_type": resp.headers.get("Content-Type"),
-            "url": url
-        }), 500
-
-    is_pdf = ("pdf" in ctype) or (content[:4] == b"%PDF")
-    if not is_pdf:
-        # tenta pegar um preview “safe” (não binário)
-        body_prev = ""
-        try:
-            body_prev = (content[:1600]).decode("utf-8", errors="replace")
-        except Exception:
-            body_prev = "<binário>"
-
-        return jsonify({
-            "ok": False,
-            "etapa": "conteudo",
-            "erro": "Resposta não parece PDF (ajuste path_pdf conforme Swagger)",
-            "http_status": resp.status_code,
-            "content_type": resp.headers.get("Content-Type"),
-            "body_preview": body_prev,
-            "url": url
-        }), 500
-
-    # retorna o PDF direto para o HTML (inline)
-    return send_file(
-        io.BytesIO(content),
-        mimetype="application/pdf",
-        as_attachment=False,
-        download_name=f"DANFSE_{chave}.pdf"
-    )
+    # Se chegou aqui, tentou os 2 ambientes e ambos deram 404 (ou o último foi 404)
+    resp = last_resp
+    url = last_url
+    prob = try_problem_json(resp) if resp is not None else None
+    return jsonify({
+        "ok": False,
+        "etapa": "http",
+        "http_status": (resp.status_code if resp is not None else 404),
+        "content_type": (resp.headers.get("Content-Type") if resp is not None else None),
+        "problem_json": prob,
+        "body_preview": (preview_body(resp, 1600) if resp is not None else ""),
+        "url": url,
+        "env_used": "tentou_producao_e_restrita",
+        "erro": "Documento não encontrado (404) nos ambientes testados. Verifique se o HTML está mandando a chave correta e o codi/user correto."
+    }), 404
 
 
 # ==========================================================
