@@ -102,6 +102,8 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
     global CERT_CACHE
     cache_key = user or "_default"
 
+    # OBS: agora o cache é limpo a cada request (ver before_request),
+    # mas mantive essa checagem por segurança
     if cache_key in CERT_CACHE:
         info = CERT_CACHE[cache_key]
         if _cache_valid_cert_tuple(info.get("cert")):
@@ -509,6 +511,9 @@ def carregar_certificados_dfe_local(
         return None, "user é obrigatório para buscar certificado (certifica_dfe)"
 
     ck = _cache_key_dfe(user, codi, empresa, cnpj_cpf)
+
+    # OBS: agora o cache é limpo a cada request (ver before_request),
+    # mas mantive essa checagem por segurança
     if ck in DFE_CERT_CACHE:
         cert_tuple = DFE_CERT_CACHE[ck].get("cert")
         if _cache_valid_cert_tuple(cert_tuple):
@@ -554,7 +559,6 @@ def carregar_certificados_dfe_local(
     pem_b64 = row.get("pem")
     key_b64 = row.get("key")
 
-    # log apenas metadados (para você confirmar que é o registro certo)
     try:
         print("DANFSE cert row:", {"id": row.get("id"), "user": row.get("user"), "codi": row.get("codi"), "empresa": row.get("empresa")})
     except Exception:
@@ -695,6 +699,52 @@ def read_stream_bytes(resp: requests.Response, max_size_bytes: int = 15 * 1024 *
             raise ValueError("Resposta grande demais (limite de segurança excedido).")
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# ==========================================================
+# ========= LIMPAR CACHE PEM/KEY A CADA REQUEST (FIX) ======
+# ==========================================================
+
+def _safe_unlink(path: Optional[str]):
+    try:
+        if path and isinstance(path, str) and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+def clear_all_cert_caches():
+    """
+    LIMPA O CACHE E APAGA OS ARQUIVOS TEMPORÁRIOS .pem/.key
+    para evitar misturar certificados entre rotas/requests.
+    """
+    global CERT_CACHE, DFE_CERT_CACHE
+
+    # SICOOB
+    try:
+        for _, info in list(CERT_CACHE.items()):
+            cert_tuple = info.get("cert")
+            if isinstance(cert_tuple, tuple) and len(cert_tuple) == 2:
+                _safe_unlink(cert_tuple[0])
+                _safe_unlink(cert_tuple[1])
+    except Exception:
+        pass
+    CERT_CACHE.clear()
+
+    # DFE/DANFSe
+    try:
+        for _, info in list(DFE_CERT_CACHE.items()):
+            cert_tuple = info.get("cert")
+            if isinstance(cert_tuple, tuple) and len(cert_tuple) == 2:
+                _safe_unlink(cert_tuple[0])
+                _safe_unlink(cert_tuple[1])
+    except Exception:
+        pass
+    DFE_CERT_CACHE.clear()
+
+@app.before_request
+def _before_request_clear_cert_cache():
+    # ✅ AQUI: limpa SEMPRE antes de atender qualquer rota
+    clear_all_cert_caches()
 
 
 # ==========================================================
@@ -966,7 +1016,6 @@ def _norm_int_or_none(v: Any) -> Optional[int]:
         return None
 
 def _safe_payload_for_log(body: Dict[str, Any]) -> Dict[str, Any]:
-    # não loga nada sensível; só o que importa pro debug do HTML
     return {
         "user": _norm_str(body.get("user")),
         "codi": body.get("codi"),
@@ -980,13 +1029,6 @@ def _safe_payload_for_log(body: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/danfse/pdf")
 def danfse_pdf():
-    """
-    TRATATIVA:
-    - Normaliza o que chega do HTML
-    - Loga payload (sem segredos)
-    - Tenta PROD e, se 404, tenta RESTRITA automaticamente
-    - Repasse status upstream (404/403/401 etc.) ao frontend
-    """
     body = request.get_json(silent=True) or {}
     print("DANFSE request body:", _safe_payload_for_log(body))
 
@@ -998,7 +1040,6 @@ def danfse_pdf():
     if not chave or len(chave) < 20:
         return jsonify({"ok": False, "erro": "Campo 'chave' inválido/curto"}), 400
 
-    # normaliza params vindos do HTML
     codi = _norm_int_or_none(body.get("codi"))
     empresa = _norm_str(body.get("empresa")) or None
     cnpj_cpf = _norm_str(body.get("cnpj_cpf")) or None
@@ -1007,13 +1048,11 @@ def danfse_pdf():
     base_url_in = _norm_str(body.get("base_url"))
     path_pdf = _norm_str(body.get("path_pdf")) or "/danfse/{chave}"
 
-    # defaults do ambiente
     def _base_for(env_local: str) -> str:
         if base_url_in:
             return base_url_in
         return "https://adn.producaorestrita.nfse.gov.br" if env_local == "restrita" else "https://adn.nfse.gov.br"
 
-    # timeouts/tries/backoff (do HTML ou defaults)
     try:
         timeout = int(body.get("timeout", 120))
     except Exception:
@@ -1027,12 +1066,10 @@ def danfse_pdf():
     except Exception:
         backoff = 1.5
 
-    # certificado (você disse que está correto)
     cert_files, errc = carregar_certificados_dfe_local(user=user, codi=codi, empresa=empresa, cnpj_cpf=cnpj_cpf)
     if errc:
         return jsonify({"ok": False, "etapa": "certifica_dfe", "erro": errc}), 500
 
-    # tenta no ambiente recebido; se der 404, tenta no outro ambiente automaticamente
     env_try_order = [env, ("restrita" if env == "producao" else "producao")]
 
     last_resp = None
@@ -1056,7 +1093,6 @@ def danfse_pdf():
 
         last_resp = resp
 
-        # Se achou PDF, para aqui
         if resp.status_code < 400:
             ctype = (resp.headers.get("Content-Type") or "").lower()
             try:
@@ -1097,11 +1133,9 @@ def danfse_pdf():
                 download_name=f"DANFSE_{chave}.pdf"
             )
 
-        # Se der 404 e ainda tem outro ambiente pra tentar, continua
         if resp.status_code == 404:
             continue
 
-        # outros erros (401/403/400/500 etc.) -> devolve imediatamente com status real
         prob = try_problem_json(resp)
         return jsonify({
             "ok": False,
@@ -1114,7 +1148,6 @@ def danfse_pdf():
             "env_used": env_try,
         }), resp.status_code
 
-    # Se chegou aqui, tentou os 2 ambientes e ambos deram 404 (ou o último foi 404)
     resp = last_resp
     url = last_url
     prob = try_problem_json(resp) if resp is not None else None
