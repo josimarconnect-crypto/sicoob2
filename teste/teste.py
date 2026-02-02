@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+
 import requests
 import tempfile
 import os
@@ -7,7 +11,6 @@ import json
 import mimetypes
 import time
 import binascii
-import re
 from typing import Dict, Any, Tuple, Optional, List
 
 app = Flask(__name__)
@@ -81,8 +84,16 @@ SICOOB_SEGUNDA_VIA_URL = f"{SICOOB_BASE_URL}/boletos/segunda-via"
 CLIENT_ID_DEFAULT = "ca417614-7d6f-4f89-ba39-f18ea496431e"
 SICOOB_SCOPE = "boletos_inclusao boletos_consulta boletos_alteracao webhooks_inclusao"
 
-# cache por user (Sicoob)
+# cache por user (Sicoob) — com TTL para evitar “colar” certificado antigo
 CERT_CACHE: Dict[str, Dict[str, Any]] = {}
+CERT_CACHE_TTL_SECONDS = 10 * 60  # 10 min
+
+def _norm_user(u: Optional[str]) -> str:
+    return (u or "").strip().lower()
+
+def _cache_valid(entry: Dict[str, Any]) -> bool:
+    ts = entry.get("_ts", 0)
+    return (time.time() - ts) < CERT_CACHE_TTL_SECONDS
 
 def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tuple[str, str]], Optional[str], Optional[int], Optional[str]]:
     """
@@ -91,18 +102,20 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
     Retorna: (cert_files, cliente_id_oauth, conta, erro)
     """
     global CERT_CACHE
-    cache_key = user or "_default"
 
-    if cache_key in CERT_CACHE:
-        info = CERT_CACHE[cache_key]
+    user_n = _norm_user(user)
+    if not user_n:
+        # ✅ NÃO deixa cair em "_default" para não misturar certificados
+        return None, None, None, "Campo 'user' é obrigatório (Sicoob) para evitar mistura de certificados."
+
+    if user_n in CERT_CACHE and _cache_valid(CERT_CACHE[user_n]):
+        info = CERT_CACHE[user_n]
         return info["cert"], info.get("cliente_id"), info.get("conta"), None
 
     if not SUPABASE_KEY:
-        return None, None, None, "SUPABASE_SERVICE_ROLE_KEY não configurada"
+        return None, None, None, "SUPABASE_KEY não configurada"
 
-    params = {"select": "pem,key,cliente_id,conta", "order": "id.desc", "limit": "1"}
-    if user:
-        params["user"] = f"eq.{user}"
+    params = {"select": "pem,key,cliente_id,conta", "order": "id.desc", "limit": "1", "user": f"eq.{user_n}"}
 
     try:
         resp = requests.get(
@@ -123,7 +136,7 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
         return None, None, None, f"Resposta inválida do Supabase: {resp.text}"
 
     if not rows:
-        return None, None, None, "Nenhum certificado encontrado para este usuário"
+        return None, None, None, "Nenhum certificado encontrado para este usuário (certifica_sicoob)"
 
     row = rows[0]
     pem_b64 = row.get("pem")
@@ -132,7 +145,7 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
     conta = row.get("conta")
 
     if not pem_b64 or not key_b64:
-        return None, None, None, "Campos pem/key vazios"
+        return None, None, None, "Campos pem/key vazios (certifica_sicoob)"
 
     try:
         pem_bytes = base64.b64decode(pem_b64)
@@ -150,12 +163,17 @@ def carregar_certificados_local(user: Optional[str] = None) -> Tuple[Optional[Tu
     except Exception as e:
         return None, None, None, f"Erro ao criar arquivos temporários: {e}"
 
-    CERT_CACHE[cache_key] = {"cert": (cert_path, key_path), "cliente_id": cliente_id, "conta": conta}
-    return CERT_CACHE[cache_key]["cert"], cliente_id, conta, None
+    CERT_CACHE[user_n] = {
+        "cert": (cert_path, key_path),
+        "cliente_id": cliente_id,
+        "conta": conta,
+        "_ts": time.time(),
+    }
+    return CERT_CACHE[user_n]["cert"], cliente_id, conta, None
 
 def gerar_token_sicoob(cert_files: Tuple[str, str], client_id_from_db: Optional[str]):
     cert_path, key_path = cert_files
-    client_id = client_id_from_db or CLIENT_ID_DEFAULT
+    client_id = (client_id_from_db or CLIENT_ID_DEFAULT or "").strip()
 
     data = {"grant_type": "client_credentials", "client_id": client_id, "scope": SICOOB_SCOPE}
 
@@ -231,7 +249,6 @@ def baixar_pdf_boleto(token: str, n_contrato: int, n_nosso: int, n_cliente: int,
         data = resp.json()
     except ValueError:
         ct = resp.headers.get("Content-Type", "")
-        txt = ""
         try:
             txt = resp.text or ""
         except Exception:
@@ -321,23 +338,14 @@ query recipient_exists($recipient: String!, $api_id: String) {
 # ==========================================================
 
 def decode_b64_to_bytes(b64_str: str) -> bytes:
-    """
-    Decodifica string base64 para bytes de forma robusta.
-    Remove prefixos 'data:*;base64,' e corrige padding.
-    """
     if not b64_str:
         return b""
-
     if "base64," in b64_str:
         b64_str = b64_str.split("base64,", 1)[1]
-
-    b64_str = b64_str.strip()
-    b64_str = b64_str.replace("\n", "").replace("\r", "").replace(" ", "")
-
+    b64_str = b64_str.strip().replace("\n", "").replace("\r", "").replace(" ", "")
     missing = (-len(b64_str)) % 4
     if missing:
         b64_str += "=" * missing
-
     try:
         return base64.b64decode(b64_str, validate=True)
     except binascii.Error:
@@ -435,7 +443,6 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
     if has_file:
         tipo = "text"
 
-    # ----------- arquivo via base64 (bytes) -----------
     if item.get("file_b64"):
         file_name = item.get("file_name") or "arquivo.bin"
         file_mime = item.get("file_mime") or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
@@ -444,9 +451,6 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
             file_bytes = decode_b64_to_bytes(item["file_b64"])
         except Exception as e:
             return None, f"file_b64 inválido: {e}"
-
-        if file_mime == "application/pdf" and file_bytes and not file_bytes.startswith(b"%PDF"):
-            print(f"⚠️ Aviso: Arquivo {file_name} não parece PDF válido (ausência de %PDF).")
 
         vars2 = {"recipient": recipient, "message": message if message else "", "tipo": tipo, "sender_name": sender_name}
 
@@ -469,7 +473,6 @@ def htchat_send_one(htchat_url: str, htchat_token: str, item: Dict[str, Any], ve
             node["_upload_mode"] = "bytes ops/map"
         return node, err
 
-    # ----------- texto -----------
     if not str(message).strip():
         return None, "message vazio (para texto é obrigatório)"
 
@@ -497,11 +500,15 @@ def htchat_get_sended(htchat_url: str, htchat_token: str, msg_internal_id: int, 
 # ============ DANFSe (OFICIAL) - CERTIFICA_DFE ============
 # ==========================================================
 
-# cache por user/codi (DFE)
 DFE_CERT_CACHE: Dict[str, Dict[str, Any]] = {}
+DFE_CACHE_TTL_SECONDS = 10 * 60
 
 def _cache_key_dfe(user: str, codi: Optional[Any], empresa: Optional[str], cnpj_cpf: Optional[str]) -> str:
     return f"{(user or '').strip().lower()}|codi={codi}|emp={(empresa or '').strip().lower()}|doc={(cnpj_cpf or '').strip()}"
+
+def _dfe_cache_valid(entry: Dict[str, Any]) -> bool:
+    ts = entry.get("_ts", 0)
+    return (time.time() - ts) < DFE_CACHE_TTL_SECONDS
 
 def carregar_certificados_dfe_local(
     user: str,
@@ -509,25 +516,18 @@ def carregar_certificados_dfe_local(
     empresa: Optional[str] = None,
     cnpj_cpf: Optional[str] = None
 ) -> Tuple[Optional[Tuple[str, str]], Optional[str]]:
-    """
-    (DFE / NFS-e / DANFSe)
-    Busca o último certificado na certifica_dfe e cria arquivos temporários PEM/KEY.
-    Campos esperados na tabela: pem, key, user, codi, empresa, ...
-    Retorna: ((cert_path, key_path), erro)
-    """
     global DFE_CERT_CACHE
 
-    if not user:
+    user_n = _norm_user(user)
+    if not user_n:
         return None, "user é obrigatório para buscar certificado (certifica_dfe)"
 
-    ck = _cache_key_dfe(user, codi, empresa, cnpj_cpf)
-    if ck in DFE_CERT_CACHE:
+    ck = _cache_key_dfe(user_n, codi, empresa, cnpj_cpf)
+    if ck in DFE_CERT_CACHE and _dfe_cache_valid(DFE_CERT_CACHE[ck]):
         return DFE_CERT_CACHE[ck]["cert"], None
 
     params = {"select": "pem,key,user,codi,empresa", "order": "id.desc", "limit": "1"}
-
-    # filtros
-    params["user"] = f"eq.{user}"
+    params["user"] = f"eq.{user_n}"
 
     if codi not in (None, "", 0, "0"):
         try:
@@ -535,14 +535,8 @@ def carregar_certificados_dfe_local(
         except Exception:
             return None, f"codi inválido: {codi}"
 
-    # se não vier codi, pode filtrar por empresa (opcional)
     if (not params.get("codi")) and empresa:
         params["empresa"] = f"eq.{empresa}"
-
-    # OBS: campo "cnpj/cpf" na sua tabela tem barra e pode exigir sintaxe especial no PostgREST.
-    # Para evitar erro, deixei esse filtro DESLIGADO por padrão.
-    # Se você quiser filtrar por ele, me diga o nome exato da coluna no Supabase (às vezes vira "cnpj_cpf" via view).
-    _ = cnpj_cpf  # reservado
 
     try:
         resp = requests.get(
@@ -588,7 +582,7 @@ def carregar_certificados_dfe_local(
     except Exception as e:
         return None, f"Erro ao criar arquivos temporários (DFE): {e}"
 
-    DFE_CERT_CACHE[ck] = {"cert": (cert_path, key_path)}
+    DFE_CERT_CACHE[ck] = {"cert": (cert_path, key_path), "_ts": time.time()}
     return DFE_CERT_CACHE[ck]["cert"], None
 
 def build_url(base: str, path_template: str, chave: str) -> str:
@@ -612,13 +606,8 @@ def http_get_with_retry(
     tries: int = 5,
     backoff_base: float = 1.5,
 ):
-    """
-    GET com retry em 502/503/504 + erros de rede.
-    Retorna Response (última) ou levanta exceção se nunca obteve resposta.
-    """
     last_exc = None
     last_resp = None
-
     headers = {
         "Accept": "application/pdf",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DANFSeDownloader/1.0",
@@ -636,15 +625,13 @@ def http_get_with_retry(
             last_resp = resp
 
             if resp.status_code in (502, 503, 504):
-                wait = backoff_base * i
-                time.sleep(wait)
+                time.sleep(backoff_base * i)
                 continue
 
             return resp
         except requests.RequestException as e:
             last_exc = e
-            wait = backoff_base * i
-            time.sleep(wait)
+            time.sleep(backoff_base * i)
 
     if last_resp is not None:
         return last_resp
@@ -669,7 +656,7 @@ def api_emitir():
 
     cert_files, cliente_id_oauth, conta_corrente, erro_cert = carregar_certificados_local(user)
     if erro_cert:
-        return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 500
+        return jsonify({"ok": False, "etapa": "certificado", "erro": erro_cert}), 400
 
     if conta_corrente is not None:
         try:
@@ -705,7 +692,7 @@ def api_pdf():
 
     cert_files, cliente_id_oauth, _, erro_cert = carregar_certificados_local(user)
     if erro_cert:
-        return jsonify({"erro": erro_cert}), 500
+        return jsonify({"erro": erro_cert}), 400
 
     try:
         num_cliente_int = int(str(numero_cliente))
@@ -731,20 +718,6 @@ def api_pdf():
 
 @app.post("/htchat/send")
 def htchat_send_batch():
-    """
-    Body:
-    {
-      "user": "teste@gmail.com",
-      "delay_seconds": 15,
-      "verify_ssl": true,
-      "htchat_url": "https://.../graphql_api",
-      "htchat_token": "TOKEN",
-      "messages": [
-        {"recipient":"5569...","tipo":"text","message":"oi"},
-        {"recipient":"5569...","tipo":"text","message":"segue","file_name":"a.pdf","file_mime":"application/pdf","file_b64":"..."}
-      ]
-    }
-    """
     body = request.get_json(silent=True) or {}
 
     user = (body.get("user") or "").strip()
@@ -914,24 +887,6 @@ def htchat_get_sended_route():
 
 @app.post("/danfse/pdf")
 def danfse_pdf():
-    """
-    Baixa DANFSe (PDF oficial) via Ambiente Nacional NFS-e (mTLS) usando PEM/KEY do Supabase (certifica_dfe).
-
-    Body exemplo:
-    {
-      "user": "operador@dominio.com",
-      "codi": 123,                       // recomendado
-      "empresa": "MINHA EMPRESA LTDA",    // opcional (se não passar codi)
-      "cnpj_cpf": "123...",               // opcional (reservado)
-      "chave": "SUA_CHAVE_DE_ACESSO",
-      "env": "producao",                  // producao | restrita (default producao)
-      "base_url": "https://adn.nfse.gov.br",   // opcional (override)
-      "path_pdf": "/danfse/{chave}",           // opcional (override)
-      "timeout": 60,
-      "tries": 5,
-      "backoff": 1.5
-    }
-    """
     body = request.get_json(silent=True) or {}
 
     user = (body.get("user") or "").strip()
@@ -1007,7 +962,6 @@ def danfse_pdf():
             "url": url
         }), 500
 
-    # retorna o PDF direto para o HTML (inline)
     return send_file(
         io.BytesIO(resp.content),
         mimetype="application/pdf",
